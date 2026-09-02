@@ -1,0 +1,12 @@
+# Default pipeline configuration.
+# Sections are added as stages land; every value used by code lives here,
+# never as a constant in a module body.
+
+io:
+  image_extensions: [".png", ".jpg", ".jpeg"]
+  # Folders of stills carry no timing. State the capture rate explicitly when
+  # the source is an image directory; leaving this null makes such a source an error.
+  image_dir_fps: null
+  start_frame: 0
+  stride: 1
+  max_frames: null
