@@ -1,12 +1,76 @@
 # Default pipeline configuration.
-# Sections are added as stages land; every value used by code lives here,
-# never as a constant in a module body.
+# Every value the code reads lives here, never as a constant in a module body.
+#
+# Only the sections listed in Config.CACHE_KEY_SECTIONS (io, calibration,
+# detector) contribute to the cache key. Changing `overlay` or `video` re-renders
+# from the existing cache instead of re-running inference.
 
 io:
   image_extensions: [".png", ".jpg", ".jpeg"]
   # Folders of stills carry no timing. State the capture rate explicitly when
   # the source is an image directory; leaving this null makes such a source an error.
   image_dir_fps: null
+  # [width, height] every frame is delivered at. null adopts the first frame's
+  # size. Frames of any other size are resampled to this, because the homography
+  # is defined for exactly one resolution.
+  canonical_size: null
+  # Take video frame times from the container's presentation timestamps, so
+  # variable-frame-rate recordings keep their true timing.
+  use_container_timestamps: true
   start_frame: 0
   stride: 1
   max_frames: null
+
+calibration:
+  intrinsics_path: calib/intrinsics.yaml
+  homography_path: calib/homography.yaml
+  # Undistorting before the homography is the more accurate route, especially for
+  # a wide-angle dashcam where barrel distortion is worst at the edges -- exactly
+  # where distant vehicles and lane markings sit. Left off by deliberate choice;
+  # the homography then absorbs whatever distortion is present. Whichever way
+  # this is set, the decision is recorded in calib/homography.yaml and in the
+  # cache manifest, so no result is ever ambiguous about it.
+  undistort: false
+  chessboard:
+    # INNER corner counts, not squares.
+    cols: 9
+    rows: 6
+    square_size_m: 0.024
+
+# Bird's-eye window in ego metres: X right, Y forward, origin at the camera's
+# ground projection.
+bev:
+  x_min_m: -6.0
+  x_max_m: 6.0
+  y_min_m: 3.0
+  y_max_m: 40.0
+  px_per_m: 20.0
+  grid_step_m: 5.0
+
+cache:
+  root: outputs
+  # Bump whenever the model or its weights change; a cache written under a
+  # different value is treated as stale and rebuilt.
+  model_version: stub-0.1
+  # null derives '<source stem>__<config hash>', so identical settings reuse the
+  # same run directory instead of piling up timestamped ones.
+  run_id: null
+
+detector:
+  kind: stub
+  score_threshold: 0.3
+  seed: 0
+
+# Presentation only -- excluded from the cache key.
+overlay:
+  box_thickness: 2
+  lane_thickness: 4
+  mask_alpha: 0.4
+  font_scale: 0.5
+  hud: true
+  hud_width_px: 340
+
+video:
+  fourcc: mp4v
+  # null inherits the emitted frame rate (source fps / io.stride).
+  fps: null

@@ -77,9 +77,9 @@ class TestImageDirSource:
     def test_size_and_count_reported(self, image_dir: Path) -> None:
         with open_source(image_dir, IOConfig(image_dir_fps=10.0)) as src:
             assert src.source_frame_count == 10
-            assert src.size is None  # unknown until the first frame is decoded
+            assert src.canonical_size is None  # adopted from the first frame read
             next(iter(src))
-            assert src.size == (WIDTH, HEIGHT)
+            assert src.canonical_size == (WIDTH, HEIGHT)
 
     def test_missing_fps_raises(self, image_dir: Path) -> None:
         with pytest.raises(ValueError, match="image_dir_fps"):
@@ -101,11 +101,17 @@ class TestImageDirSource:
             with open_source(image_dir, IOConfig(image_dir_fps=10.0)) as src:
                 list(src)
 
-    def test_resolution_change_mid_sequence_raises(self, image_dir: Path) -> None:
+    def test_odd_sized_frame_is_resized_to_canonical_and_flagged(
+        self, image_dir: Path
+    ) -> None:
+        """A mid-sequence size change is absorbed, not hidden: the frame says so."""
         cv2.imwrite(str(image_dir / "frame5b.png"), _synthetic_frame(5, width=32, height=24))
-        with pytest.raises(ValueError, match="frame size changed"):
-            with open_source(image_dir, IOConfig(image_dir_fps=10.0)) as src:
-                list(src)
+        with open_source(image_dir, IOConfig(image_dir_fps=10.0)) as src:
+            frames = list(src)
+        assert {f.size for f in frames} == {(WIDTH, HEIGHT)}
+        odd = [f for f in frames if f.was_resized]
+        assert len(odd) == 1 and odd[0].native_size == (32, 24)
+        assert src.n_resized == 1
 
 
 class TestVideoSource:
@@ -177,8 +183,15 @@ class TestFrameSelection:
 
 class TestFrame:
     def test_size_is_width_height(self) -> None:
-        frame = Frame(index=0, source_index=0, timestamp_s=0.0, image=_synthetic_frame(0))
+        frame = Frame(
+            index=0,
+            source_index=0,
+            timestamp_s=0.0,
+            image=_synthetic_frame(0),
+            native_size=(WIDTH, HEIGHT),
+        )
         assert frame.size == (WIDTH, HEIGHT)
+        assert frame.was_resized is False
 
 
 class TestIOConfig:
