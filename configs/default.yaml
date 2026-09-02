@@ -49,26 +49,63 @@ bev:
 
 cache:
   root: outputs
-  # Bump whenever the model or its weights change; a cache written under a
-  # different value is treated as stale and rebuilt.
-  model_version: stub-0.1
+  # Model identity is taken from the detector itself (name + weights hash),
+  # not configured here, so swapping weights invalidates caches automatically.
   # null derives '<source stem>__<config hash>', so identical settings reuse the
   # same run directory instead of piling up timestamped ones.
   run_id: null
 
 detector:
-  kind: stub
+  kind: yolopv2            # 'stub' runs the pipeline with no model at all
+  weights: models/yolopv2.pt
+  input_size: 640          # long side; padded to a multiple of `stride`
+  stride: 32
+  conf_threshold: 0.3
+  iou_threshold: 0.45
+  max_detections: 100
+  lane_threshold: 0.5
+  device: auto             # warns loudly if this lands on CPU
+  half: true               # fp16 on CUDA only
+  batch_size: 4
+  # Stub-only knobs, ignored by the real backbone.
   score_threshold: 0.3
   seed: 0
+  # YOLOPv2 has no pedestrian class, and no released multi-task network in that
+  # family does (HybridNets ships obj_list:['car']). Vulnerable road users
+  # therefore need a second model. It emits ONLY person/bicycle/motorcycle --
+  # vehicles come from YOLOPv2, and taking them from both would double-count.
+  vru:
+    enabled: true
+    architecture: fasterrcnn_mobilenet_v3_large_320_fpn
+    conf_threshold: 0.5
+
+# Sliding-window lane fitting, in bird's-eye metres.
+lanes:
+  n_windows: 12
+  window_half_width_m: 0.6
+  min_pixels_per_window: 25
+  min_pixels_for_fit: 150
+  min_mask_pixels: 300
+  # Must reach past the adjacent lane's outer edge: for a 3.5 m lane that sits
+  # at 1.75 + 3.5 = 5.25 m, so a 5 m search finds no adjacent lanes at all.
+  search_half_width_m: 7.0
+  min_lane_width_m: 2.2
+  max_lane_width_m: 5.0
+  eval_distance_m: 10.0
+  adjacent_lanes: true
 
 # Presentation only -- excluded from the cache key.
 overlay:
   box_thickness: 2
   lane_thickness: 4
-  mask_alpha: 0.4
+  mask_alpha: 0.35
+  # The raw lane mask under the fitted curves is the visual check that
+  # calibration and fitting agree. Keep it on.
+  show_lane_mask: true
+  lane_mask_alpha: 0.85
   font_scale: 0.5
   hud: true
-  hud_width_px: 340
+  hud_width_px: 380
 
 video:
   fourcc: mp4v

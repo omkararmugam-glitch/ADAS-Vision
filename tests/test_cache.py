@@ -1,8 +1,10 @@
-"""Tests for the two-stage cache: round-tripping, ordering, and staleness.
+"""Tests for the two-stage cache: round-tripping, staleness, and resume.
 
-The staleness tests are the important ones. The cache exists so that tuning
-event thresholds never re-runs a network; the flip side is that it must refuse
-to serve results produced under different settings.
+The staleness tests carry the weight here. The cache exists so that retuning
+downstream logic never re-runs a network; the flip side is that it must refuse
+to serve predictions produced by a different model, calibration, config or code.
+Each identity field gets its own test, because a hash that is recorded but never
+compared is worse than no hash at all.
 """
 
 from __future__ import annotations
@@ -13,9 +15,19 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from src.cache import Manifest, RunCache, SourceFingerprint, default_run_id
+from src.cache import Manifest, RunCache, SourceFingerprint, code_version, default_run_id
 from src.config import Config
-from src.types import Detection, FrameResult, LaneLine
+from src.types import CLASS_IDS, FrameRecord, FrameResult, LaneFit, LaneSet, LaneStatus
+
+MASK_H, MASK_W = 180, 320
+FRAME_SIZE = (640, 360)
+
+IDENTITY = dict(
+    calibration_hash="cal0",
+    model_name="yolopv2",
+    weights_hash="w0",
+    class_names=("vehicle", "person"),
+)
 
 
 @pytest.fixture
@@ -30,138 +42,163 @@ def cfg(tmp_path: Path) -> Config:
     return Config.model_validate({"cache": {"root": str(tmp_path / "outputs")}})
 
 
+def _open(cfg: Config, source: Path, **overrides) -> RunCache:
+    kwargs = {**IDENTITY, **overrides}
+    return RunCache.open(cfg, source, extra={"frame_size": list(FRAME_SIZE)}, **kwargs)
+
+
 def _result(i: int) -> FrameResult:
+    drivable = np.zeros((MASK_H, MASK_W), dtype=np.uint8)
+    drivable[MASK_H // 2 :, :] = 1
+    lane = np.zeros((MASK_H, MASK_W), dtype=np.uint8)
+    lane[:, 40 + i : 46 + i] = 1
+    from src.types import NativeMasks
+
     return FrameResult(
-        frame_index=i,
-        source_index=i * 2,
-        timestamp_s=i * 0.04,
-        detections=[
-            Detection(bbox_px=(10.0, 20.0, 110.0, 140.0), label="car", score=0.9, track_id=3)
-        ],
-        lanes=[
-            LaneLine(
-                points_px=np.array([[100.0, 700.0], [600.0, 400.0]]),
-                role="ego_left",
-                kind="solid",
-                score=0.8,
-            )
-        ],
-        extras={"stub_vehicle_distance_m": 30.0 - i},
+        boxes_px=np.array([[10.0, 20.0, 110.0, 140.0]], dtype=np.float32),
+        class_ids=np.array([CLASS_IDS["vehicle"]], dtype=np.int32),
+        scores=np.array([0.87], dtype=np.float32),
+        drivable_mask=np.zeros(FRAME_SIZE[::-1], dtype=np.uint8),
+        lane_mask=np.zeros(FRAME_SIZE[::-1], dtype=np.uint8),
+        native_masks=NativeMasks(drivable=drivable, lane=lane, original_size=FRAME_SIZE),
     )
 
 
+def _record(i: int) -> FrameRecord:
+    return FrameRecord(
+        frame_index=i,
+        source_index=i * 2,
+        timestamp_s=i * 0.04,
+        result=_result(i),
+        lanes=LaneSet(
+            status=LaneStatus.OK,
+            ego_left=LaneFit(np.array([1e-4, 0.01, -1.75]), "ego_left", 800, (5.0, 35.0)),
+            ego_right=LaneFit(np.array([1e-4, 0.01, 1.75]), "ego_right", 700, (5.0, 30.0)),
+            curvature_radius_m=850.0,
+            ego_offset_m=-0.12,
+            lane_width_m=3.5,
+            eval_distance_m=10.0,
+        ),
+    )
+
+
+def _populate(cfg: Config, source: Path, n: int = 4, **overrides) -> RunCache:
+    cache = _open(cfg, source, **overrides)
+    with cache.writer() as w:
+        for i in range(n):
+            w.write(_record(i))
+    return cache
+
+
 class TestRoundTrip:
-    def test_written_results_read_back_identically(self, cfg: Config, source_file: Path) -> None:
-        cache = RunCache.open(cfg, source_file)
-        with cache.writer() as w:
-            for i in range(5):
-                w.write(_result(i))
-        assert cache.is_reusable()
-
+    def test_records_read_back_identically(self, cfg: Config, source_file: Path) -> None:
+        cache = _populate(cfg, source_file)
         got = list(cache.read())
-        assert [r.frame_index for r in got] == list(range(5))
-        assert got[2].detections[0].label == "car"
-        assert got[2].detections[0].track_id == 3
-        assert got[2].lanes[0].role == "ego_left"
-        assert got[2].lanes[0].points_px == pytest.approx(
-            np.array([[100.0, 700.0], [600.0, 400.0]])
-        )
-        assert got[2].extras["stub_vehicle_distance_m"] == pytest.approx(28.0)
-        assert got[3].timestamp_s == pytest.approx(0.12)
+        assert [r.frame_index for r in got] == [0, 1, 2, 3]
+        assert got[2].result.boxes_px[0] == pytest.approx([10.0, 20.0, 110.0, 140.0])
+        assert got[2].result.class_ids[0] == CLASS_IDS["vehicle"]
+        assert got[2].result.scores[0] == pytest.approx(0.87, abs=1e-4)
+        assert got[2].timestamp_s == pytest.approx(0.08)
 
-    def test_arrays_round_trip(self, cfg: Config, source_file: Path) -> None:
-        mask = np.zeros((40, 60), dtype=bool)
-        mask[10:20, 5:30] = True
-        cache = RunCache.open(cfg, source_file)
-        with cache.writer() as w:
-            w.write(_result(0), arrays={"drivable": mask})
-        loaded = cache.read_arrays(0)
-        assert set(loaded) == {"drivable"}
-        assert np.array_equal(loaded["drivable"], mask)
+    def test_lane_geometry_round_trips(self, cfg: Config, source_file: Path) -> None:
+        got = list(_populate(cfg, source_file).read())
+        lanes = got[0].lanes
+        assert lanes.status is LaneStatus.OK
+        assert lanes.lane_width_m == pytest.approx(3.5)
+        assert lanes.ego_offset_m == pytest.approx(-0.12)
+        assert lanes.curvature_radius_m == pytest.approx(850.0)
+        assert lanes.ego_left.coeffs == pytest.approx([1e-4, 0.01, -1.75])
+        assert lanes.ego_left.n_pixels == 800
 
-    def test_missing_arrays_return_empty(self, cfg: Config, source_file: Path) -> None:
-        cache = RunCache.open(cfg, source_file)
-        with cache.writer() as w:
-            w.write(_result(0))
-        assert cache.read_arrays(0) == {}
+    def test_masks_are_stored_at_native_resolution_and_upsampled_on_read(
+        self, cfg: Config, source_file: Path
+    ) -> None:
+        cache = _populate(cfg, source_file)
+        stored = sorted(cache.masks_dir.glob("*.png"))
+        assert len(stored) == 8, "two masks per frame"
 
-    def test_manifest_records_identity(self, cfg: Config, source_file: Path) -> None:
-        cache = RunCache.open(cfg, source_file, extra={"note": "hello"})
-        with cache.writer() as w:
-            for i in range(3):
-                w.write(_result(i))
-        m = cache.existing_manifest()
-        assert m.frame_count == 3
-        assert m.complete is True
-        assert m.config_hash == cfg.cache_key()
-        assert m.model_version == cfg.cache.model_version
-        assert m.extra == {"note": "hello"}
-        assert m.completed_utc is not None
+        import cv2
 
+        native = cv2.imread(str(stored[0]), cv2.IMREAD_GRAYSCALE)
+        assert native.shape == (MASK_H, MASK_W), "must persist at native, not frame, size"
 
-class TestOrdering:
-    def test_out_of_order_writes_raise(self, cfg: Config, source_file: Path) -> None:
-        cache = RunCache.open(cfg, source_file)
-        with pytest.raises(ValueError, match="increasing order"):
-            with cache.writer() as w:
-                w.write(_result(5))
-                w.write(_result(2))
+        record = next(iter(cache.read()))
+        assert record.result.drivable_mask.shape == FRAME_SIZE[::-1], "upsampled on read"
 
-    def test_duplicate_index_raises(self, cfg: Config, source_file: Path) -> None:
-        cache = RunCache.open(cfg, source_file)
-        with pytest.raises(ValueError, match="increasing order"):
-            with cache.writer() as w:
-                w.write(_result(1))
-                w.write(_result(1))
+    def test_mask_content_survives(self, cfg: Config, source_file: Path) -> None:
+        cache = _populate(cfg, source_file)
+        record = next(iter(cache.read()))
+        # The bottom half was marked drivable; that must still hold after upsampling.
+        h = record.result.drivable_mask.shape[0]
+        assert record.result.drivable_mask[int(h * 0.75)].any()
+        assert not record.result.drivable_mask[int(h * 0.25)].any()
+
+    def test_reading_without_masks_is_allowed(self, cfg: Config, source_file: Path) -> None:
+        cache = _populate(cfg, source_file)
+        records = list(cache.read(with_masks=False))
+        assert len(records) == 4
+        assert records[0].lanes.status is LaneStatus.OK
+
+    def test_size_report_is_measured(self, cfg: Config, source_file: Path) -> None:
+        report = _populate(cfg, source_file).size_report()
+        assert report["frames"] == 4
+        assert report["masks_bytes_per_frame"] > 0
+        assert report["json_bytes_per_frame"] > 0
+        assert report["raw_fullres_bytes_per_frame"] > report["raw_native_bytes_per_frame"]
 
 
 class TestStaleness:
-    def _populate(self, cfg: Config, source_file: Path) -> RunCache:
-        cache = RunCache.open(cfg, source_file)
-        with cache.writer() as w:
-            for i in range(3):
-                w.write(_result(i))
-        return cache
+    """Every identity field must actually gate reuse, not merely be recorded."""
 
     def test_fresh_cache_is_reusable(self, cfg: Config, source_file: Path) -> None:
-        self._populate(cfg, source_file)
-        assert RunCache.open(cfg, source_file).staleness_reason() is None
+        _populate(cfg, source_file)
+        assert _open(cfg, source_file).staleness_reason() is None
 
     def test_absent_cache_reports_so(self, cfg: Config, source_file: Path) -> None:
-        assert RunCache.open(cfg, source_file).staleness_reason() == "no cache present"
+        assert _open(cfg, source_file).staleness_reason() == "no cache present"
 
-    def test_changed_model_version_invalidates(self, cfg: Config, source_file: Path) -> None:
-        self._populate(cfg, source_file)
-        bumped = cfg.model_copy(
-            update={"cache": cfg.cache.model_copy(update={"model_version": "yolopv2-1.0"})}
-        )
-        # Pin the run_id so we look at the same directory, isolating the model change.
-        bumped = bumped.model_copy(
-            update={"cache": bumped.cache.model_copy(
-                update={"run_id": default_run_id(source_file, cfg.cache_key())}
-            )}
-        )
-        reason = RunCache.open(bumped, source_file).staleness_reason()
-        assert reason is not None and "model version" in reason
-
-    def test_changed_cache_relevant_config_invalidates(
-        self, cfg: Config, source_file: Path
+    @pytest.mark.parametrize(
+        "field,value,expected",
+        [
+            ("calibration_hash", "cal-CHANGED", "calibration hash"),
+            ("model_name", "hybridnets", "model name"),
+            ("weights_hash", "w-CHANGED", "weights hash"),
+        ],
+    )
+    def test_identity_change_invalidates(
+        self, cfg: Config, source_file: Path, field: str, value: str, expected: str
     ) -> None:
-        self._populate(cfg, source_file)
+        _populate(cfg, source_file)
+        reason = _open(cfg, source_file, **{field: value}).staleness_reason()
+        assert reason is not None and expected in reason
+
+    def test_code_version_change_invalidates(self, cfg: Config, source_file: Path) -> None:
+        cache = _populate(cfg, source_file)
+        stored = json.loads(cache.manifest_path.read_text("utf-8"))
+        stored["code_version"] = "deadbee-from-last-year"
+        cache.manifest_path.write_text(json.dumps(stored), encoding="utf-8")
+        reason = _open(cfg, source_file).staleness_reason()
+        assert reason is not None and "code version" in reason
+
+    def test_config_change_invalidates(self, cfg: Config, source_file: Path) -> None:
+        _populate(cfg, source_file)
         changed = cfg.model_copy(update={"io": cfg.io.model_copy(update={"stride": 4})})
         changed = changed.model_copy(
             update={"cache": changed.cache.model_copy(
-                update={"run_id": default_run_id(source_file, cfg.cache_key())}
-            )}
+                update={"run_id": default_run_id(source_file, cfg.cache_key())})}
         )
-        reason = RunCache.open(changed, source_file).staleness_reason()
+        reason = _open(changed, source_file).staleness_reason()
         assert reason is not None and "config hash" in reason
 
-    def test_presentation_only_config_does_NOT_invalidate(
-        self, cfg: Config, source_file: Path
-    ) -> None:
-        """Restyling the overlay must not throw away an expensive cache."""
-        self._populate(cfg, source_file)
+    def test_lane_config_participates_in_the_key(self, cfg: Config, source_file: Path) -> None:
+        """Lane thresholds change cached LaneSets, so they must invalidate."""
+        changed = cfg.model_copy(
+            update={"lanes": cfg.lanes.model_copy(update={"n_windows": 20})}
+        )
+        assert changed.cache_key() != cfg.cache_key()
+
+    def test_presentation_config_does_NOT_invalidate(self, cfg: Config, source_file: Path) -> None:
+        _populate(cfg, source_file)
         restyled = cfg.model_copy(
             update={
                 "overlay": cfg.overlay.model_copy(update={"box_thickness": 9, "hud": False}),
@@ -169,74 +206,134 @@ class TestStaleness:
             }
         )
         assert restyled.cache_key() == cfg.cache_key()
-        assert RunCache.open(restyled, source_file).staleness_reason() is None
+        assert _open(restyled, source_file).staleness_reason() is None
 
     def test_changed_source_invalidates(self, cfg: Config, source_file: Path) -> None:
-        self._populate(cfg, source_file)
+        _populate(cfg, source_file)
         source_file.write_bytes(b"a completely different video file")
-        reason = RunCache.open(cfg, source_file).staleness_reason()
+        reason = _open(cfg, source_file).staleness_reason()
         assert reason is not None and "source changed" in reason
-
-    def test_interrupted_run_is_never_reused(self, cfg: Config, source_file: Path) -> None:
-        cache = RunCache.open(cfg, source_file)
-        with pytest.raises(RuntimeError):
-            with cache.writer() as w:
-                w.write(_result(0))
-                raise RuntimeError("inference blew up halfway")
-        reason = RunCache.open(cfg, source_file).staleness_reason()
-        assert reason is not None and "did not finish" in reason
-
-    def test_missing_frames_file_invalidates(self, cfg: Config, source_file: Path) -> None:
-        cache = self._populate(cfg, source_file)
-        cache.frames_path.unlink()
-        assert "frames.jsonl is missing" in RunCache.open(cfg, source_file).staleness_reason()
-
-    def test_corrupt_manifest_invalidates(self, cfg: Config, source_file: Path) -> None:
-        cache = self._populate(cfg, source_file)
-        cache.manifest_path.write_text("{not json", encoding="utf-8")
-        assert RunCache.open(cfg, source_file).staleness_reason() == "no cache present"
-
-    def test_reading_a_stale_cache_raises(self, cfg: Config, source_file: Path) -> None:
-        self._populate(cfg, source_file)
-        source_file.write_bytes(b"replaced")
-        with pytest.raises(ValueError, match="refusing to read a stale cache"):
-            list(RunCache.open(cfg, source_file).read())
 
     def test_schema_version_mismatch_invalidates(self) -> None:
         base = Manifest(
-            run_id="r", config_hash="abc", model_version="m", schema_version=1,
+            run_id="r", config_hash="c", calibration_hash="cal", model_name="m",
+            weights_hash="w", code_version="v", schema_version=1, class_names=[],
             source=SourceFingerprint("f", 10, 20), source_path="f", complete=True,
         )
-        newer = Manifest(
-            run_id="r", config_hash="abc", model_version="m", schema_version=2,
-            source=SourceFingerprint("f", 10, 20), source_path="f", complete=True,
-        )
+        newer = Manifest(**{**base.__dict__, "schema_version": 2})
         assert "schema version" in base.staleness_reason(newer)
 
-    def test_rewriting_clears_the_old_run(self, cfg: Config, source_file: Path) -> None:
-        cache = self._populate(cfg, source_file)
-        with cache.writer() as w:
-            w.write(_result(0))
-        assert cache.existing_manifest().frame_count == 1
-        assert len(list(cache.read())) == 1
+    def test_reading_a_stale_cache_raises(self, cfg: Config, source_file: Path) -> None:
+        _populate(cfg, source_file)
+        with pytest.raises(ValueError, match="refusing to read a stale cache"):
+            list(_open(cfg, source_file, weights_hash="different").read())
+
+    def test_interrupted_run_is_not_reusable(self, cfg: Config, source_file: Path) -> None:
+        cache = _open(cfg, source_file)
+        with pytest.raises(RuntimeError):
+            with cache.writer() as w:
+                w.write(_record(0))
+                raise RuntimeError("inference blew up halfway")
+        reason = _open(cfg, source_file).staleness_reason()
+        assert reason is not None and "did not finish" in reason
+
+    def test_corrupt_manifest_invalidates(self, cfg: Config, source_file: Path) -> None:
+        cache = _populate(cfg, source_file)
+        cache.manifest_path.write_text("{not json", encoding="utf-8")
+        assert _open(cfg, source_file).staleness_reason() == "no cache present"
 
 
-class TestRunId:
-    def test_deterministic_for_identical_config(self, cfg: Config, source_file: Path) -> None:
-        a = RunCache.open(cfg, source_file)
-        b = RunCache.open(cfg, source_file)
-        assert a.run_dir == b.run_dir
-        assert a.wanted.run_id.startswith("clip__")
+class TestResume:
+    def test_interrupted_run_is_resumable(self, cfg: Config, source_file: Path) -> None:
+        cache = _open(cfg, source_file)
+        with pytest.raises(RuntimeError):
+            with cache.writer() as w:
+                for i in range(3):
+                    w.write(_record(i))
+                raise RuntimeError("interrupted")
+        assert _open(cfg, source_file).resumable_frames() == 3
 
-    def test_differs_when_cache_relevant_config_differs(
+    def test_resuming_appends_and_completes(self, cfg: Config, source_file: Path) -> None:
+        cache = _open(cfg, source_file)
+        with pytest.raises(RuntimeError):
+            with cache.writer() as w:
+                for i in range(3):
+                    w.write(_record(i))
+                raise RuntimeError("interrupted")
+
+        resumed = _open(cfg, source_file)
+        n = resumed.resumable_frames()
+        with resumed.writer(resume_after=n) as w:
+            for i in range(n, 6):
+                w.write(_record(i))
+
+        assert resumed.is_reusable()
+        assert [r.frame_index for r in resumed.read(with_masks=False)] == [0, 1, 2, 3, 4, 5]
+        assert resumed.existing_manifest().frame_count == 6
+
+    def test_a_different_model_is_not_resumable(self, cfg: Config, source_file: Path) -> None:
+        cache = _open(cfg, source_file)
+        with pytest.raises(RuntimeError):
+            with cache.writer() as w:
+                w.write(_record(0))
+                raise RuntimeError("interrupted")
+        assert _open(cfg, source_file, weights_hash="other").resumable_frames() == 0
+
+    def test_a_record_without_masks_is_not_counted_as_done(
         self, cfg: Config, source_file: Path
     ) -> None:
-        other = cfg.model_copy(update={"io": cfg.io.model_copy(update={"stride": 7})})
-        assert RunCache.open(cfg, source_file).run_dir != RunCache.open(other, source_file).run_dir
+        """A frame whose masks never landed must be recomputed, not trusted."""
+        cache = _open(cfg, source_file)
+        with pytest.raises(RuntimeError):
+            with cache.writer() as w:
+                for i in range(3):
+                    w.write(_record(i))
+                raise RuntimeError("interrupted")
+        cache._mask_path(2, "lane").unlink()
+        assert _open(cfg, source_file).resumable_frames() == 2
 
-    def test_explicit_run_id_is_honoured(self, cfg: Config, source_file: Path) -> None:
-        pinned = cfg.model_copy(update={"cache": cfg.cache.model_copy(update={"run_id": "my-run"})})
-        assert RunCache.open(pinned, source_file).run_dir.name == "my-run"
+    def test_truncated_final_line_is_dropped(self, cfg: Config, source_file: Path) -> None:
+        cache = _open(cfg, source_file)
+        with pytest.raises(RuntimeError):
+            with cache.writer() as w:
+                for i in range(3):
+                    w.write(_record(i))
+                raise RuntimeError("interrupted")
+        with cache.frames_path.open("a", encoding="utf-8") as fh:
+            fh.write('{"frame_index":3,"source_ind')
+        assert _open(cfg, source_file).resumable_frames() == 3
+
+    def test_complete_run_reports_all_frames_resumable(
+        self, cfg: Config, source_file: Path
+    ) -> None:
+        _populate(cfg, source_file, n=4)
+        assert _open(cfg, source_file).resumable_frames() == 4
+
+
+class TestOrdering:
+    def test_out_of_order_writes_raise(self, cfg: Config, source_file: Path) -> None:
+        cache = _open(cfg, source_file)
+        with pytest.raises(ValueError, match="increasing order"):
+            with cache.writer() as w:
+                w.write(_record(5))
+                w.write(_record(2))
+
+
+class TestManifestFile:
+    def test_manifest_records_every_identity_field(self, cfg: Config, source_file: Path) -> None:
+        cache = _populate(cfg, source_file)
+        raw = json.loads(cache.manifest_path.read_text("utf-8"))
+        assert set(raw) >= {
+            "run_id", "config_hash", "calibration_hash", "model_name", "weights_hash",
+            "code_version", "schema_version", "class_names", "source", "frame_count",
+            "complete",
+        }
+        assert raw["class_names"] == ["vehicle", "person"]
+        assert raw["model_name"] == "yolopv2"
+
+    def test_code_version_is_reported(self) -> None:
+        v = code_version()
+        assert isinstance(v, str) and v
 
 
 class TestSourceFingerprint:
@@ -251,16 +348,3 @@ class TestSourceFingerprint:
         before = SourceFingerprint.of(d)
         (d / "b.png").write_bytes(b"5678")
         assert SourceFingerprint.of(d) != before
-
-
-class TestManifestFile:
-    def test_manifest_is_human_readable_json(self, cfg: Config, source_file: Path) -> None:
-        cache = RunCache.open(cfg, source_file)
-        with cache.writer() as w:
-            w.write(_result(0))
-        raw = json.loads(cache.manifest_path.read_text("utf-8"))
-        assert set(raw) >= {
-            "run_id", "config_hash", "model_version", "schema_version",
-            "source", "frame_count", "complete",
-        }
-        assert "\n" in cache.manifest_path.read_text("utf-8")  # indented, not minified

@@ -202,42 +202,140 @@ class CacheConfig(_Strict):
 
     Attributes:
         root: Directory holding one subdirectory per run.
-        model_version: Free-form identifier for whatever produced the per-frame
-            results. Bump it whenever the model or its weights change; a cache
-            written under a different value is treated as stale.
         run_id: Fixed run directory name, or None to derive one from the source
             name and the config hash (so identical settings reuse the cache).
     """
 
     root: Path = Path("outputs")
-    model_version: str = "stub-0.1"
     run_id: str | None = None
 
 
-class DetectorConfig(_Strict):
-    """Settings for the Stage 1 stub detector.
+class VRUConfig(_Strict):
+    """Second detector covering vulnerable road users.
 
-    Replaced wholesale when the real YOLOPv2 backbone lands; it exists only to
-    prove the pipeline end to end.
+    YOLOPv2 has no pedestrian class and no released multi-task network in that
+    family does, so people, bicycles and motorcycles need their own model. This
+    one deliberately emits only those classes; vehicles come from YOLOPv2 and
+    taking them from both would double-count every car.
 
     Attributes:
-        kind: Which detector implementation to run. Only ``"stub"`` exists now.
-        score_threshold: Detections below this confidence are dropped.
-        seed: Makes the fake detections deterministic, so cache reuse is testable.
+        enabled: Whether to run the second model at all.
+        architecture: A torchvision ``models.detection`` builder name.
+        conf_threshold: Minimum confidence for a kept detection.
     """
 
-    kind: str = "stub"
+    enabled: bool = True
+    architecture: str = "fasterrcnn_mobilenet_v3_large_320_fpn"
+    conf_threshold: float = 0.5
+
+    @field_validator("conf_threshold")
+    @classmethod
+    def _unit(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError(f"conf_threshold must be in [0, 1], got {v}")
+        return v
+
+
+class DetectorConfig(_Strict):
+    """Perception model settings.
+
+    Attributes:
+        kind: ``"yolopv2"`` for the real backbone, ``"stub"`` for the synthetic
+            detector that keeps pipeline tests fast and model-free.
+        weights: TorchScript weights path for the real backbone.
+        input_size: Network input size for the longer image side. The letterbox
+            pads to a multiple of ``stride`` from there.
+        stride: Network stride; the padded input is a multiple of this.
+        conf_threshold: Minimum detection confidence.
+        iou_threshold: NMS IoU threshold.
+        max_detections: Cap on boxes kept per frame after NMS.
+        lane_threshold: Probability above which a lane pixel is set.
+        device: ``"auto"``, ``"cpu"``, ``"cuda"``, or an explicit ``"cuda:N"``.
+            ``auto`` warns loudly when it lands on CPU.
+        half: Use fp16 on CUDA. Ignored on CPU, where fp16 is slower.
+        batch_size: Frames per forward pass.
+        score_threshold: Stub only -- fake detections below this are dropped.
+        seed: Stub only -- makes the fake output deterministic.
+        vru: Second-detector settings.
+    """
+
+    kind: str = "yolopv2"
+    weights: Path = Path("models/yolopv2.pt")
+    input_size: int = 640
+    stride: int = 32
+    conf_threshold: float = 0.3
+    iou_threshold: float = 0.45
+    max_detections: int = 100
+    lane_threshold: float = 0.5
+    device: str = "auto"
+    half: bool = True
+    batch_size: int = 4
     score_threshold: float = 0.3
     seed: int = 0
+    vru: VRUConfig = Field(default_factory=VRUConfig)
 
     @field_validator("kind")
     @classmethod
     def _known_kind(cls, v: str) -> str:
-        if v != "stub":
-            raise ValueError(
-                f"unknown detector kind '{v}'. Only 'stub' exists at this stage; "
-                f"the real backbone arrives with Stage 2."
-            )
+        if v not in ("stub", "yolopv2"):
+            raise ValueError(f"unknown detector kind '{v}'; expected 'stub' or 'yolopv2'")
+        return v
+
+    @field_validator("input_size", "stride", "batch_size", "max_detections")
+    @classmethod
+    def _positive_int(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"must be >= 1, got {v}")
+        return v
+
+    @field_validator("conf_threshold", "iou_threshold", "lane_threshold", "score_threshold")
+    @classmethod
+    def _unit_interval(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError(f"must be in [0, 1], got {v}")
+        return v
+
+
+class LaneFitConfig(_Strict):
+    """Sliding-window lane fitting in the bird's-eye view.
+
+    Attributes:
+        n_windows: Vertical search windows per boundary.
+        window_half_width_m: Lateral half-width of each search window.
+        min_pixels_per_window: Pixels needed in a window before its centre is
+            used to re-centre the next one.
+        min_pixels_for_fit: Total pixels a boundary needs before a polynomial is
+            fitted at all. Below this the status is MASK_TOO_SPARSE rather than
+            a fit nobody should trust.
+        min_mask_pixels: Lane pixels needed in the whole bird's-eye window before
+            fitting is attempted.
+        search_half_width_m: Lateral extent either side of the camera axis
+            searched for boundaries. Must reach past the adjacent lane's far
+            edge -- for a 3.5 m lane that boundary sits at 1.75 + 3.5 = 5.25 m,
+            so a 5 m search silently finds no adjacent lanes at all.
+        max_lane_width_m / min_lane_width_m: Plausibility bounds on the measured
+            ego lane width. Outside these the pair is rejected as a mis-pairing.
+        eval_distance_m: Forward distance at which curvature, offset and width
+            are reported.
+        adjacent_lanes: Whether to also fit boundaries outside the ego lane.
+    """
+
+    n_windows: int = 12
+    window_half_width_m: float = 0.6
+    min_pixels_per_window: int = 25
+    min_pixels_for_fit: int = 150
+    min_mask_pixels: int = 300
+    search_half_width_m: float = 7.0
+    min_lane_width_m: float = 2.2
+    max_lane_width_m: float = 5.0
+    eval_distance_m: float = 10.0
+    adjacent_lanes: bool = True
+
+    @field_validator("n_windows", "min_pixels_per_window", "min_pixels_for_fit", "min_mask_pixels")
+    @classmethod
+    def _positive(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"must be >= 1, got {v}")
         return v
 
 
@@ -247,7 +345,10 @@ class OverlayConfig(_Strict):
     Attributes:
         box_thickness: Outline width in pixels for detection boxes.
         lane_thickness: Polyline width in pixels for lane boundaries.
-        mask_alpha: Blend weight for translucent masks, in ``[0, 1]``.
+        mask_alpha: Blend weight for the drivable-area fill, in ``[0, 1]``.
+        show_lane_mask: Draw the raw lane segmentation under the fitted curves.
+            This is what makes the fit checkable by eye.
+        lane_mask_alpha: Blend weight for the raw lane mask.
         font_scale: OpenCV Hershey font scale for labels and HUD text.
         hud: Whether to draw the text HUD panel.
         hud_width_px: Width of the HUD panel.
@@ -255,16 +356,18 @@ class OverlayConfig(_Strict):
 
     box_thickness: int = 2
     lane_thickness: int = 4
-    mask_alpha: float = 0.4
+    mask_alpha: float = 0.35
+    show_lane_mask: bool = True
+    lane_mask_alpha: float = 0.85
     font_scale: float = 0.5
     hud: bool = True
-    hud_width_px: int = 340
+    hud_width_px: int = 380
 
-    @field_validator("mask_alpha")
+    @field_validator("mask_alpha", "lane_mask_alpha")
     @classmethod
     def _unit_interval(cls, v: float) -> float:
         if not 0.0 <= v <= 1.0:
-            raise ValueError(f"mask_alpha must be in [0, 1], got {v}")
+            raise ValueError(f"alpha must be in [0, 1], got {v}")
         return v
 
 
@@ -296,13 +399,14 @@ class Config(_Strict):
     bev: BEVConfig = Field(default_factory=BEVConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
     detector: DetectorConfig = Field(default_factory=DetectorConfig)
+    lanes: LaneFitConfig = Field(default_factory=LaneFitConfig)
     overlay: OverlayConfig = Field(default_factory=OverlayConfig)
     video: VideoConfig = Field(default_factory=VideoConfig)
 
     #: Sections whose values change cached per-frame results. Presentation-only
     #: sections are deliberately absent: restyling the overlay must not
     #: invalidate an expensive cache.
-    CACHE_KEY_SECTIONS: ClassVar[tuple[str, ...]] = ("io", "calibration", "detector")
+    CACHE_KEY_SECTIONS: ClassVar[tuple[str, ...]] = ("io", "calibration", "bev", "detector", "lanes")
 
     def cache_key_payload(self) -> dict[str, Any]:
         """The config subset that cached results depend on."""

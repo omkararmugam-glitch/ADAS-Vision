@@ -1,25 +1,26 @@
 """Two-stage cache: expensive per-frame model output on disk, cheap rules on top.
 
 This is the piece that makes threshold tuning survivable. Per-frame results are
-written once under ``outputs/<run_id>/``; the rule engine and the overlay read
-them back without touching a network. Re-running with different event thresholds
-must never re-run inference.
+written once under ``outputs/<run_id>/``; the rule engine, the lane analysis and
+the overlay read them back without loading a model at all.
 
 Layout of a run directory::
 
     outputs/<run_id>/
-        manifest.json      identity, staleness fields, and completion state
-        frames.jsonl       one FrameResult per line, ordered by frame_index
-        arrays/            optional per-frame .npz for masks and other big arrays
+        manifest.json      identity, staleness fields, completion state
+        frames.jsonl       one FrameRecord per line, ordered by frame_index
+        masks/             <frame>_drivable.png and <frame>_lane.png
 
-Staleness is decided by the manifest, not by timestamps. A cache is reusable only
-if the config hash, model version, schema version and source fingerprint all
-match, and the run was marked complete. Anything else is reported with a specific
-reason and rebuilt.
+Masks are stored as **paletted PNG at the network's native resolution**, not as
+full-resolution arrays. Two reasons: the network predicts at its letterboxed
+input size and upsampling adds interpolated pixels but no information; and PNG's
+lossless run-length-friendly compression suits binary masks far better than raw
+bytes. Both effects are measured and reported by ``cache_size_report``.
 
-JSONL rather than one file per frame: a 1260-frame run is one append-only file,
-sequential to write and to scan, instead of 1260 directory entries. Masks stay
-out of it, in ``.npz``, because base64 in JSON would be both slow and enormous.
+Staleness is decided by the manifest, never by timestamps. A cache is reusable
+only if every identity field matches -- config hash, calibration hash, model
+name, weights hash, code version, schema version and source fingerprint -- and
+the run was marked complete. Any mismatch raises on read.
 """
 
 from __future__ import annotations
@@ -27,32 +28,56 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+import subprocess
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+import cv2
 import numpy as np
 
 from src.config import Config
+from src.detect import LetterboxTransform
 from src.logging_utils import get_logger, log_kv
-from src.types import SCHEMA_VERSION, FrameResult
+from src.types import SCHEMA_VERSION, FrameRecord, FrameResult
 
 _log = get_logger(__name__)
 
 MANIFEST_NAME = "manifest.json"
 FRAMES_NAME = "frames.jsonl"
-ARRAYS_DIR = "arrays"
+MASKS_DIR = "masks"
+
+
+def code_version() -> str:
+    """Short git description of the working tree, or ``"unknown"``.
+
+    Recorded so a cache produced by different code is not silently reused after
+    a change to post-processing. A dirty tree is marked, because the commit hash
+    alone would then be a lie.
+    """
+    try:
+        rev = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=10, check=True,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            capture_output=True, text=True, timeout=10, check=True,
+        ).stdout.strip()
+        return f"{rev}-dirty" if dirty else rev
+    except (subprocess.SubprocessError, OSError, FileNotFoundError):
+        return "unknown"
 
 
 @dataclass(frozen=True)
 class SourceFingerprint:
     """Cheap identity for an input source, without hashing gigabytes of pixels.
 
-    Size and mtime catch the realistic case -- the file was replaced or re-encoded.
-    They will not catch a byte-level edit that preserves both, which is a trade
-    made deliberately: hashing a 25 MB video on every run to guard against an
-    implausible case is not worth the seconds.
+    Size and mtime catch the realistic case -- the file was replaced or
+    re-encoded. They will not catch a byte-level edit preserving both, a trade
+    made deliberately: hashing a 25 MB video every run to guard an implausible
+    case is not worth the seconds.
     """
 
     name: str
@@ -77,25 +102,19 @@ class SourceFingerprint:
 class Manifest:
     """Identity and completion state of one cached run.
 
-    Attributes:
-        run_id: Name of the run directory.
-        config_hash: :meth:`~src.config.Config.cache_key` at write time.
-        model_version: Identifier of whatever produced the per-frame results.
-        schema_version: Version of the :mod:`src.types` serialisation format.
-        source: Fingerprint of the input media.
-        source_path: Where the input came from, for human readers.
-        frame_count: Frames actually written.
-        complete: False until the writer closes cleanly. An interrupted run is
-            never reused -- a half-written cache is worse than no cache.
-        created_utc: When the run started.
-        completed_utc: When the writer closed, or None.
-        extra: Free-form provenance, e.g. the calibration in force.
+    Every field except ``frame_count``, ``complete`` and the timestamps takes
+    part in staleness: a difference in any of them means the cached predictions
+    were produced by a different system and must not be reused.
     """
 
     run_id: str
     config_hash: str
-    model_version: str
+    calibration_hash: str
+    model_name: str
+    weights_hash: str
+    code_version: str
     schema_version: int
+    class_names: list[str]
     source: SourceFingerprint
     source_path: str
     frame_count: int = 0
@@ -103,6 +122,16 @@ class Manifest:
     created_utc: str = ""
     completed_utc: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+
+    #: Fields compared when deciding whether a cache may be reused.
+    IDENTITY_FIELDS = (
+        ("schema_version", "schema version"),
+        ("config_hash", "config hash"),
+        ("calibration_hash", "calibration hash"),
+        ("model_name", "model name"),
+        ("weights_hash", "weights hash"),
+        ("code_version", "code version"),
+    )
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -114,8 +143,12 @@ class Manifest:
         return cls(
             run_id=d["run_id"],
             config_hash=d["config_hash"],
-            model_version=d["model_version"],
+            calibration_hash=d["calibration_hash"],
+            model_name=d["model_name"],
+            weights_hash=d["weights_hash"],
+            code_version=d["code_version"],
             schema_version=int(d["schema_version"]),
+            class_names=list(d["class_names"]),
             source=SourceFingerprint(**d["source"]),
             source_path=d["source_path"],
             frame_count=int(d["frame_count"]),
@@ -125,21 +158,25 @@ class Manifest:
             extra=d.get("extra", {}),
         )
 
-    def staleness_reason(self, other: Manifest) -> str | None:
+    def staleness_reason(self, other: Manifest, require_complete: bool = True) -> str | None:
         """Why a cache written as ``self`` cannot serve a run wanting ``other``.
 
-        Returns None when the cache is reusable.
+        Args:
+            other: The identity the caller needs.
+            require_complete: When False, an unfinished run is acceptable --
+                that is what makes resuming possible.
+
+        Returns:
+            None when the cache is usable.
         """
-        if not self.complete:
-            return "previous run did not finish (partial cache)"
-        if self.schema_version != other.schema_version:
-            return f"schema version {self.schema_version} != {other.schema_version}"
-        if self.config_hash != other.config_hash:
-            return f"config hash {self.config_hash} != {other.config_hash}"
-        if self.model_version != other.model_version:
-            return f"model version '{self.model_version}' != '{other.model_version}'"
+        for attr, label in self.IDENTITY_FIELDS:
+            mine, theirs = getattr(self, attr), getattr(other, attr)
+            if mine != theirs:
+                return f"{label} {mine!r} != {theirs!r}"
         if self.source != other.source:
             return f"source changed ({self.source.name}: size or mtime differs)"
+        if require_complete and not self.complete:
+            return "previous run did not finish (partial cache)"
         return None
 
 
@@ -153,17 +190,7 @@ def default_run_id(source_path: str | Path, config_hash: str) -> str:
 
 
 class RunCache:
-    """Read/write access to one run directory.
-
-    Typical use::
-
-        cache = RunCache.open(cfg, source_path)
-        if cache.is_reusable():
-            results = list(cache.read())
-        else:
-            with cache.writer() as w:
-                for frame in source: w.write(compute(frame))
-    """
+    """Read/write access to one run directory."""
 
     def __init__(self, run_dir: Path, wanted: Manifest) -> None:
         self.run_dir = run_dir
@@ -171,16 +198,27 @@ class RunCache:
 
     @classmethod
     def open(
-        cls, cfg: Config, source_path: str | Path, extra: dict[str, Any] | None = None
+        cls,
+        cfg: Config,
+        source_path: str | Path,
+        calibration_hash: str,
+        model_name: str,
+        weights_hash: str,
+        class_names: tuple[str, ...] = (),
+        extra: dict[str, Any] | None = None,
     ) -> RunCache:
-        """Locate the run directory implied by ``cfg`` and this source."""
+        """Locate the run directory implied by this config, model and source."""
         config_hash = cfg.cache_key()
         run_id = cfg.cache.run_id or default_run_id(source_path, config_hash)
         wanted = Manifest(
             run_id=run_id,
             config_hash=config_hash,
-            model_version=cfg.cache.model_version,
+            calibration_hash=calibration_hash,
+            model_name=model_name,
+            weights_hash=weights_hash,
+            code_version=code_version(),
             schema_version=SCHEMA_VERSION,
+            class_names=list(class_names),
             source=SourceFingerprint.of(source_path),
             source_path=str(source_path),
             extra=extra or {},
@@ -198,8 +236,11 @@ class RunCache:
         return self.run_dir / FRAMES_NAME
 
     @property
-    def arrays_dir(self) -> Path:
-        return self.run_dir / ARRAYS_DIR
+    def masks_dir(self) -> Path:
+        return self.run_dir / MASKS_DIR
+
+    def _mask_path(self, frame_index: int, which: str) -> Path:
+        return self.masks_dir / f"{frame_index:08d}_{which}.png"
 
     # -- staleness ---------------------------------------------------------- #
 
@@ -211,25 +252,22 @@ class RunCache:
             return Manifest.from_dict(json.loads(self.manifest_path.read_text("utf-8")))
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             log_kv(
-                _log,
-                logging.WARNING,
-                "cache.manifest_unreadable",
-                path=str(self.manifest_path),
-                error=type(exc).__name__,
+                _log, logging.WARNING, "cache.manifest_unreadable",
+                path=str(self.manifest_path), error=type(exc).__name__,
             )
             return None
 
-    def staleness_reason(self) -> str | None:
+    def staleness_reason(self, require_complete: bool = True) -> str | None:
         """Why the cache on disk cannot be reused, or None if it can."""
         existing = self.existing_manifest()
         if existing is None:
             return "no cache present"
         if not self.frames_path.is_file():
             return "manifest present but frames.jsonl is missing"
-        return existing.staleness_reason(self.wanted)
+        return existing.staleness_reason(self.wanted, require_complete=require_complete)
 
     def is_reusable(self) -> bool:
-        """True when the cached run matches this config, model and source."""
+        """True when the cached run matches this config, model, calibration and source."""
         reason = self.staleness_reason()
         if reason is None:
             log_kv(
@@ -240,6 +278,54 @@ class RunCache:
         log_kv(_log, logging.INFO, "cache.miss", run_id=self.wanted.run_id, reason=reason)
         return False
 
+    def resumable_frames(self) -> int:
+        """How many leading frames of a matching, unfinished run can be kept.
+
+        Returns 0 when nothing is reusable -- a different config, model or source
+        means the partial results describe a different computation.
+        """
+        reason = self.staleness_reason(require_complete=False)
+        if reason is not None:
+            return 0
+        existing = self.existing_manifest()
+        assert existing is not None
+        if existing.complete:
+            return existing.frame_count
+        n = self._count_intact_records()
+        log_kv(
+            _log, logging.INFO, "cache.resumable",
+            run_id=self.wanted.run_id, frames=n,
+            note="partial run matches; resuming after these frames",
+        )
+        return n
+
+    def _count_intact_records(self) -> int:
+        """Frames with a complete JSON line *and* both mask files present.
+
+        An interrupted run can leave a truncated final line or a record whose
+        masks were never written; those frames must be recomputed.
+        """
+        if not self.frames_path.is_file():
+            return 0
+        n = 0
+        with self.frames_path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                    idx = int(d["frame_index"])
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                    break
+                if not (
+                    self._mask_path(idx, "drivable").is_file()
+                    and self._mask_path(idx, "lane").is_file()
+                ):
+                    break
+                n += 1
+        return n
+
     def invalidate(self) -> None:
         """Delete the run directory. Called before rewriting a stale cache."""
         if self.run_dir.exists():
@@ -248,19 +334,41 @@ class RunCache:
 
     # -- writing ------------------------------------------------------------ #
 
-    def writer(self) -> CacheWriter:
-        """Open a writer, clearing any stale cache in this directory first."""
-        return CacheWriter(self)
+    def writer(self, resume_after: int = 0) -> CacheWriter:
+        """Open a writer.
+
+        Args:
+            resume_after: Keep this many existing leading frames and append after
+                them. 0 clears the directory and starts fresh.
+        """
+        return CacheWriter(self, resume_after=resume_after)
 
     # -- reading ------------------------------------------------------------ #
 
-    def read(self) -> Iterator[FrameResult]:
-        """Yield cached per-frame results in frame order.
+    def read_masks(self, frame_index: int, original_size: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
+        """Load one frame's masks and upsample them to the original frame size."""
+        out = []
+        for which in ("drivable", "lane"):
+            path = self._mask_path(frame_index, which)
+            if not path.is_file():
+                raise FileNotFoundError(f"cached mask missing: {path}")
+            mask = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                raise OSError(f"could not decode cached mask: {path}")
+            out.append(LetterboxTransform.upsample_cached_mask(mask, original_size))
+        return out[0], out[1]
+
+    def read(self, with_masks: bool = True) -> Iterator[FrameRecord]:
+        """Yield cached per-frame records in frame order.
+
+        Args:
+            with_masks: Load and upsample the masks. Set False when only the
+                detections and lane geometry are needed -- it is much faster.
 
         Raises:
             FileNotFoundError: if there is nothing cached here.
-            ValueError: if the cache is stale -- callers must rebuild rather than
-                silently mixing results from different configs.
+            ValueError: if the cache is stale. Callers must rebuild rather than
+                silently mixing results from different models or configs.
         """
         reason = self.staleness_reason()
         if reason is not None:
@@ -268,86 +376,153 @@ class RunCache:
                 f"refusing to read a stale cache at {self.run_dir}: {reason}. "
                 f"Rebuild it, or call invalidate() first."
             )
+        size = tuple(self.existing_manifest().extra.get("frame_size", (0, 0)))
         with self.frames_path.open("r", encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
-                if line:
-                    yield FrameResult.from_dict(json.loads(line))
+                if not line:
+                    continue
+                d = json.loads(line)
+                if with_masks:
+                    drivable, lane = self.read_masks(int(d["frame_index"]), size)
+                else:
+                    blank = np.zeros((1, 1), dtype=np.uint8)
+                    drivable, lane = blank, blank.copy()
+                yield FrameRecord.from_dict(d, drivable, lane)
 
-    def read_arrays(self, frame_index: int) -> dict[str, np.ndarray]:
-        """Load the per-frame arrays for ``frame_index``; empty dict if none."""
-        path = self.arrays_dir / f"{frame_index:08d}.npz"
-        if not path.is_file():
-            return {}
-        with np.load(path) as data:
-            return {k: data[k] for k in data.files}
+    # -- reporting ---------------------------------------------------------- #
+
+    def size_report(self) -> dict[str, float]:
+        """Measured bytes per frame, broken down by component.
+
+        Also reports what full-resolution raw storage *would* have cost, which is
+        the comparison that justifies storing masks at native resolution.
+        """
+        manifest = self.existing_manifest()
+        n = max(1, manifest.frame_count if manifest else 1)
+        masks = sorted(self.masks_dir.glob("*.png")) if self.masks_dir.is_dir() else []
+        mask_bytes = sum(p.stat().st_size for p in masks)
+        json_bytes = self.frames_path.stat().st_size if self.frames_path.is_file() else 0
+
+        report = {
+            "frames": float(n),
+            "masks_bytes_per_frame": mask_bytes / n,
+            "json_bytes_per_frame": json_bytes / n,
+            "total_bytes_per_frame": (mask_bytes + json_bytes) / n,
+            "total_mb": (mask_bytes + json_bytes) / 1e6,
+        }
+        if masks:
+            sample = cv2.imread(str(masks[0]), cv2.IMREAD_GRAYSCALE)
+            w, h = tuple(manifest.extra.get("frame_size", (0, 0))) if manifest else (0, 0)
+            report["mask_native_shape"] = float(sample.shape[0])
+            report["raw_native_bytes_per_frame"] = float(2 * sample.size)
+            report["raw_fullres_bytes_per_frame"] = float(2 * w * h)
+        return report
 
 
 class CacheWriter:
     """Append-only writer for one run. Use as a context manager.
 
     The manifest is only marked complete on clean exit, so an interrupted run
-    leaves a cache that :meth:`RunCache.is_reusable` will reject.
+    leaves a cache that :meth:`RunCache.is_reusable` rejects -- but that
+    :meth:`RunCache.resumable_frames` can still continue from.
     """
 
-    def __init__(self, cache: RunCache) -> None:
+    def __init__(self, cache: RunCache, resume_after: int = 0) -> None:
         self._cache = cache
         self._manifest = cache.wanted
         self._fh: Any = None
-        self._count = 0
-        self._last_index = -1
+        self._count = resume_after
+        self._resume_after = resume_after
+        self._last_index = resume_after - 1
 
     def __enter__(self) -> CacheWriter:
-        self._cache.invalidate()
-        self._cache.run_dir.mkdir(parents=True, exist_ok=True)
+        if self._resume_after > 0:
+            self._truncate_to(self._resume_after)
+            self._fh = self._cache.frames_path.open("a", encoding="utf-8")
+            log_kv(
+                _log, logging.INFO, "cache.write.resume",
+                run_dir=str(self._cache.run_dir), after_frame=self._resume_after,
+            )
+        else:
+            self._cache.invalidate()
+            self._cache.run_dir.mkdir(parents=True, exist_ok=True)
+            self._fh = self._cache.frames_path.open("w", encoding="utf-8")
+            log_kv(
+                _log, logging.INFO, "cache.write.start",
+                run_dir=str(self._cache.run_dir),
+                config_hash=self._manifest.config_hash,
+                model=self._manifest.model_name,
+                weights=self._manifest.weights_hash[:12],
+                code=self._manifest.code_version,
+            )
         self._manifest.created_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
         self._manifest.complete = False
-        self._manifest.frame_count = 0
         self._write_manifest()
-        self._fh = self._cache.frames_path.open("w", encoding="utf-8")
-        log_kv(
-            _log, logging.INFO, "cache.write.start",
-            run_dir=str(self._cache.run_dir),
-            config_hash=self._manifest.config_hash,
-            model_version=self._manifest.model_version,
-        )
         return self
 
+    def _truncate_to(self, n: int) -> None:
+        """Drop any records past frame ``n - 1``, so appends stay contiguous."""
+        kept: list[str] = []
+        with self._cache.frames_path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                if len(kept) >= n:
+                    break
+                if line.strip():
+                    kept.append(line.rstrip("\n"))
+        self._cache.frames_path.write_text(
+            "".join(x + "\n" for x in kept), encoding="utf-8"
+        )
+
     def _write_manifest(self) -> None:
+        self._cache.run_dir.mkdir(parents=True, exist_ok=True)
+        self._manifest.frame_count = self._count
         self._cache.manifest_path.write_text(
             json.dumps(self._manifest.to_dict(), indent=2), encoding="utf-8"
         )
 
-    def write(self, result: FrameResult, arrays: dict[str, np.ndarray] | None = None) -> None:
-        """Append one frame's result, plus optional arrays such as masks.
+    def write(self, record: FrameRecord, result: FrameResult | None = None) -> None:
+        """Append one frame's record, writing its masks alongside.
+
+        Masks are taken from ``result.native_masks`` when present, so what lands
+        on disk is what the network predicted rather than an upsampled copy.
 
         Raises:
             ValueError: if frames arrive out of order; the reader relies on the
                 file being ordered by ``frame_index``.
         """
-        if result.frame_index <= self._last_index:
+        if record.frame_index <= self._last_index:
             raise ValueError(
                 f"frames must be written in increasing order: got "
-                f"{result.frame_index} after {self._last_index}"
+                f"{record.frame_index} after {self._last_index}"
             )
-        self._fh.write(json.dumps(result.to_dict(), separators=(",", ":")) + "\n")
-        self._last_index = result.frame_index
+        result = result or record.result
+        native = result.native_masks
+        drivable = native.drivable if native is not None else result.drivable_mask
+        lane = native.lane if native is not None else result.lane_mask
+
+        self._cache.masks_dir.mkdir(parents=True, exist_ok=True)
+        for which, mask in (("drivable", drivable), ("lane", lane)):
+            # Scale {0,1} to {0,255}: a 0/1 PNG is technically fine but unviewable
+            # in any image tool, which makes debugging a cached run needlessly hard.
+            ok = cv2.imwrite(
+                str(self._cache._mask_path(record.frame_index, which)),
+                (np.asarray(mask) > 0).astype(np.uint8) * 255,
+                [cv2.IMWRITE_PNG_COMPRESSION, 9],
+            )
+            if not ok:
+                raise OSError(f"failed to write cached {which} mask for frame {record.frame_index}")
+
+        self._fh.write(json.dumps(record.to_dict(), separators=(",", ":")) + "\n")
+        self._last_index = record.frame_index
         self._count += 1
-        if arrays:
-            self._cache.arrays_dir.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(
-                self._cache.arrays_dir / f"{result.frame_index:08d}.npz", **arrays
-            )
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         if self._fh is not None:
             self._fh.close()
-        self._manifest.frame_count = self._count
         if exc_type is None:
             self._manifest.complete = True
-            self._manifest.completed_utc = datetime.now(timezone.utc).isoformat(
-                timespec="seconds"
-            )
+            self._manifest.completed_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
             log_kv(
                 _log, logging.INFO, "cache.write.done",
                 run_dir=str(self._cache.run_dir), frames=self._count,
@@ -357,6 +532,6 @@ class CacheWriter:
                 _log, logging.ERROR, "cache.write.aborted",
                 run_dir=str(self._cache.run_dir), frames=self._count,
                 error=exc_type.__name__,
-                note="manifest left incomplete; this cache will not be reused",
+                note="manifest left incomplete; resume will continue from here",
             )
         self._write_manifest()

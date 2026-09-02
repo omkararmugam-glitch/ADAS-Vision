@@ -21,6 +21,7 @@ plausible-looking number.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -39,6 +40,22 @@ _log = get_logger(__name__)
 #: Points whose projective denominator falls below this are treated as being on
 #: the horizon, where the ground plane maps to infinity.
 _HORIZON_EPS = 1e-9
+
+
+def file_sha256_of_text(path: str | Path) -> str:
+    """SHA-256 of a calibration file's bytes, for cache invalidation.
+
+    Any edit to the homography changes every metre the pipeline reports, so a
+    cache produced under different calibration must never be reused.
+
+    Raises:
+        FileNotFoundError: if the file is absent -- calibration is required, and
+            a missing file is an error rather than an empty hash.
+    """
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(f"calibration file not found for hashing: {p}")
+    return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
 # --------------------------------------------------------------------------- #
