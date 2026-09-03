@@ -1,6 +1,6 @@
 """A fake detector, so the pipeline can be exercised without loading a model.
 
-This implements the same :class:`~src.detect.Detector` interface as the real
+This implements the same :class:`~models.perception.Detector` interface as the real
 backbone, which keeps the end-to-end tests fast (no 156 MB of weights, no GPU)
 and keeps ``predict`` runnable on a machine with no model at all.
 
@@ -21,10 +21,10 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from src.calibrate import CameraModel
-from src.config import DetectorConfig
-from src.detect import Detector
-from src.types import CLASS_IDS, FrameResult, NativeMasks
+from core.calibrate import CameraModel
+from core.config import DetectorConfig
+from models.perception import Detector
+from core.types import CLASS_IDS, FrameResult, NativeMasks
 
 #: Nominal geometry of the synthetic lead vehicle, in metres.
 _VEHICLE_WIDTH_M = 1.8

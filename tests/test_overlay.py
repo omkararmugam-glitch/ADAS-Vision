@@ -13,9 +13,9 @@ import cv2
 import numpy as np
 import pytest
 
-from src.calibrate import CameraModel, rectangle_world_points, solve_ground_homography
-from src.config import OverlayConfig, VideoConfig
-from src.overlay import (
+from core.calibrate import CameraModel, rectangle_world_points, solve_ground_homography
+from core.config import OverlayConfig, VideoConfig
+from core.overlay import (
     VideoWriter,
     annotate,
     draw_boxes,
@@ -26,7 +26,7 @@ from src.overlay import (
     lane_color,
     lane_hud_lines,
 )
-from src.types import CLASS_IDS, FrameResult, LaneFit, LaneSet, LaneStatus
+from core.types import CLASS_IDS, FrameResult, LaneFit, LaneSet, LaneStatus
 from tests.test_calibrate import HEIGHT, WIDTH, project_ground_to_image
 
 

@@ -3,7 +3,7 @@
 Pipeline for one frame:
 
 1. Warp the lane mask from image pixels to the bird's-eye window using the
-   Stage 0 :class:`~src.calibrate.CameraModel`. In that view a real lane
+   Stage 0 :class:`~core.calibrate.CameraModel`. In that view a real lane
    boundary is close to a straight vertical line, which is what makes a
    low-order polynomial the right model.
 2. Convert the surviving mask pixels to ego metres (X right, Y forward).
@@ -18,7 +18,7 @@ This module is stateless by design. Temporal smoothing belongs to a later stage,
 and mixing it in here would make a single frame's fit unreproducible.
 
 Degraded input is reported, never faked. If the mask is empty, too sparse, or
-supports only one boundary, the returned :class:`~src.types.LaneSet` says so and
+supports only one boundary, the returned :class:`~core.types.LaneSet` says so and
 leaves the coefficients absent -- downstream code must not be handed a garbage
 polynomial that looks like a real measurement.
 """
@@ -30,10 +30,10 @@ import logging
 import cv2
 import numpy as np
 
-from src.calibrate import CameraModel
-from src.config import BEVConfig, LaneFitConfig
-from src.logging_utils import get_logger, log_kv
-from src.types import LaneFit, LaneSet, LaneStatus
+from core.calibrate import CameraModel
+from core.config import BEVConfig, LaneFitConfig
+from core.logging_utils import get_logger, log_kv
+from core.types import LaneFit, LaneSet, LaneStatus
 
 _log = get_logger(__name__)
 
@@ -165,7 +165,7 @@ class LaneFitter:
                 frame size this fitter's camera is calibrated for.
 
         Returns:
-            A :class:`~src.types.LaneSet`. Check ``status`` before trusting any
+            A :class:`~core.types.LaneSet`. Check ``status`` before trusting any
             field; degraded frames carry an explicit state, not a fake fit.
         """
         bev_mask = self.warp_mask(lane_mask_px)

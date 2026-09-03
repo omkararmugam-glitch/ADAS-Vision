@@ -1,10 +1,26 @@
-# Install torch/torchvision first, from the CUDA 12.8 index -- the default PyPI
-# wheels do not cover this machine's Blackwell (sm_120) GPU:
+# IMPORTANT -- install torch first, from the CUDA 12.8 index. The default PyPI
+# wheels do not carry kernels for this machine's Blackwell GPU (RTX 5050, sm_120):
+#
 #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+#
+# Verified working: torch 2.11.0+cu128 on Python 3.14, sm_120.
 torch>=2.11
 torchvision
+
+# Core pipeline.
 opencv-python>=4.10
 numpy>=2.0
 pyyaml>=6.0
 pydantic>=2.9
+
+# Test suite.
 pytest>=8.0
+
+# --- Added per build stage; not yet required by the code on this branch. ---
+# ultralytics>=8.3      # step 3: YOLOv8 baseline + pothole detector
+# timm>=1.0             # step 3/4: weather classifier backbones, MiDaS/DPT
+# scipy>=1.14           # step 4: ByteTrack Hungarian assignment
+# pandas>=2.2           # step 7: metrics tables
+# streamlit>=1.39       # step 8: optional dashboard
+# onnx>=1.17            # step 8: export
+# onnxruntime-gpu>=1.20 # step 8: FPS benchmark

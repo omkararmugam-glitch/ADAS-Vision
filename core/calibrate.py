@@ -7,7 +7,7 @@ Coordinate frames used throughout:
   * **ego metres** -- ``(x, y)``, X right, Y forward, origin at the camera's
     ground projection. The road is assumed planar at Z = 0.
   * **BEV px** -- pixels of the rendered bird's-eye image, a pure affine
-    rescaling of ego metres fixed by :class:`~src.config.BEVConfig`.
+    rescaling of ego metres fixed by :class:`~core.config.BEVConfig`.
 
 All metric output in this project comes from the homography here. There is no
 depth network anywhere in the pipeline, so the quality of these four points sets
@@ -32,8 +32,8 @@ import cv2
 import numpy as np
 import yaml
 
-from src.config import BEVConfig, ChessboardConfig, Config, load_config
-from src.logging_utils import StageTimer, get_logger, log_kv
+from core.config import BEVConfig, ChessboardConfig, Config, load_config
+from core.logging_utils import StageTimer, get_logger, log_kv
 
 _log = get_logger(__name__)
 
@@ -725,7 +725,7 @@ def _cmd_intrinsics(args: argparse.Namespace, cfg: Config) -> int:
 
 def _load_reference_frame(cfg: Config, source: str, frame_index: int) -> np.ndarray:
     """Grab one frame from a video or image folder for calibration/verification."""
-    from src.io import open_source  # local import: io imports config, not calibrate
+    from core.io import open_source  # local import: io imports config, not calibrate
 
     io_cfg = cfg.io.model_copy(update={"start_frame": frame_index, "max_frames": 1})
     with open_source(source, io_cfg) as src:

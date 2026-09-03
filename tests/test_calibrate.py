@@ -14,7 +14,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from src.calibrate import (
+from core.calibrate import (
     CameraModel,
     Intrinsics,
     calibrate_intrinsics,
@@ -23,7 +23,7 @@ from src.calibrate import (
     rectangle_world_points,
     solve_ground_homography,
 )
-from src.config import BEVConfig, ChessboardConfig
+from core.config import BEVConfig, ChessboardConfig
 
 WIDTH, HEIGHT = 1280, 720
 #: Tolerance for quantities recovered through a *solved* homography. cv2's

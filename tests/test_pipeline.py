@@ -14,14 +14,14 @@ import numpy as np
 import pytest
 
 import run as run_cli
-from src.cache import RunCache
-from src.calibrate import CameraModel, rectangle_world_points, solve_ground_homography
-from src.config import DetectorConfig, IOConfig, load_config
-from src.detect import Detector, build_detector
-from src.io import open_source
-from src.lanes import LaneFitter
-from src.stubs import StubDetector
-from src.types import LaneStatus
+from core.cache import RunCache
+from core.calibrate import CameraModel, rectangle_world_points, solve_ground_homography
+from core.config import DetectorConfig, IOConfig, load_config
+from models.perception import Detector, build_detector
+from core.io import open_source
+from models.lane_seg.fitting import LaneFitter
+from models.perception.stub import StubDetector
+from core.types import LaneStatus
 from tests.test_calibrate import HEIGHT, WIDTH, project_ground_to_image
 
 
@@ -158,7 +158,7 @@ class TestStubDetector:
         self, camera: CameraModel
     ) -> None:
         """Full loop: stub paints markings through calibration, fitter recovers them."""
-        from src.config import BEVConfig, LaneFitConfig
+        from core.config import BEVConfig, LaneFitConfig
 
         det = StubDetector(camera, DetectorConfig(kind="stub"), lane_half_width_m=1.85)
         det.set_time(0.0)
@@ -215,7 +215,7 @@ def project(tmp_path: Path, camera: CameraModel, road_video: Path):
 
 
 def _cache_for(cfg_path: Path, video: Path) -> RunCache:
-    from src.calibrate import file_sha256_of_text
+    from core.calibrate import file_sha256_of_text
 
     cfg = load_config(cfg_path)
     return RunCache.open(
@@ -256,7 +256,7 @@ class TestPredictAndRender:
         cfg_path, video, tmp_path = project
         run_cli.main(["--config", str(cfg_path), "predict", "--source", str(video)])
 
-        import src.detect as detect_mod
+        import models.perception as detect_mod
 
         def explode(*_a, **_k):
             raise AssertionError("render must not build a detector")

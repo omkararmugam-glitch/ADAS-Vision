@@ -56,8 +56,11 @@ cache:
   run_id: null
 
 detector:
-  kind: yolopv2            # 'stub' runs the pipeline with no model at all
-  weights: models/yolopv2.pt
+  # 'yolopv2' multi-task backbone (boxes + drivable + lane in one pass),
+  # 'yolov8'  single-task baseline (boxes only; lanes come from models/lane_seg),
+  # 'stub'    runs the whole pipeline with no model at all.
+  kind: yolopv2
+  weights: models/perception/weights/yolopv2.pt
   input_size: 640          # long side; padded to a multiple of `stride`
   stride: 32
   conf_threshold: 0.3

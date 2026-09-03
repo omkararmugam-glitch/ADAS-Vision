@@ -15,9 +15,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from src.cache import Manifest, RunCache, SourceFingerprint, code_version, default_run_id
-from src.config import Config
-from src.types import CLASS_IDS, FrameRecord, FrameResult, LaneFit, LaneSet, LaneStatus
+from core.cache import Manifest, RunCache, SourceFingerprint, code_version, default_run_id
+from core.config import Config
+from core.types import CLASS_IDS, FrameRecord, FrameResult, LaneFit, LaneSet, LaneStatus
 
 MASK_H, MASK_W = 180, 320
 FRAME_SIZE = (640, 360)
@@ -52,7 +52,7 @@ def _result(i: int) -> FrameResult:
     drivable[MASK_H // 2 :, :] = 1
     lane = np.zeros((MASK_H, MASK_W), dtype=np.uint8)
     lane[:, 40 + i : 46 + i] = 1
-    from src.types import NativeMasks
+    from core.types import NativeMasks
 
     return FrameResult(
         boxes_px=np.array([[10.0, 20.0, 110.0, 140.0]], dtype=np.float32),

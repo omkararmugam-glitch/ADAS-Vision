@@ -1,9 +1,9 @@
 """Annotation rendering: masks, boxes, fitted lane curves, a text HUD, and MP4.
 
-Everything here consumes :mod:`src.types` values in **image pixel** coordinates
+Everything here consumes :mod:`core.types` values in **image pixel** coordinates
 at the canonical frame size, and draws on a copy -- no function mutates the frame
 it is handed. Lane polynomials arrive in bird's-eye metres and are reprojected
-through the :class:`~src.calibrate.CameraModel`, which is precisely the visual
+through the :class:`~core.calibrate.CameraModel`, which is precisely the visual
 check that calibration and fitting agree: the reprojected curve should lie along
 the lane pixels it was fitted to.
 
@@ -19,11 +19,11 @@ from types import TracebackType
 import cv2
 import numpy as np
 
-from src.calibrate import CameraModel
-from src.config import OverlayConfig, VideoConfig
-from src.lanes import fit_to_image_points
-from src.logging_utils import get_logger, log_kv
-from src.types import FrameResult, LaneSet, LaneStatus, class_name
+from core.calibrate import CameraModel
+from core.config import OverlayConfig, VideoConfig
+from models.lane_seg.fitting import fit_to_image_points
+from core.logging_utils import get_logger, log_kv
+from core.types import FrameResult, LaneSet, LaneStatus, class_name
 
 _log = get_logger(__name__)
 

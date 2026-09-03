@@ -13,10 +13,10 @@ import cv2
 import numpy as np
 import pytest
 
-from src.calibrate import CameraModel, rectangle_world_points, solve_ground_homography
-from src.config import BEVConfig, LaneFitConfig
-from src.lanes import LaneFitter, fit_to_image_points
-from src.types import LaneStatus
+from core.calibrate import CameraModel, rectangle_world_points, solve_ground_homography
+from core.config import BEVConfig, LaneFitConfig
+from models.lane_seg.fitting import LaneFitter, fit_to_image_points
+from core.types import LaneStatus
 from tests.test_calibrate import HEIGHT, WIDTH, project_ground_to_image
 
 MARKING_WIDTH_M = 0.16
@@ -245,35 +245,35 @@ class TestReprojection:
 
 class TestLaneFitMath:
     def test_x_at_evaluates_the_polynomial(self) -> None:
-        from src.types import LaneFit
+        from core.types import LaneFit
 
         fit = LaneFit(coeffs=np.array([0.001, 0.02, -1.75]), role="ego_left",
                       n_pixels=500, y_range_m=(5, 40))
         assert float(fit.x_at(10.0)[0]) == pytest.approx(0.001 * 100 + 0.02 * 10 - 1.75)
 
     def test_straight_line_has_infinite_radius(self) -> None:
-        from src.types import LaneFit
+        from core.types import LaneFit
 
         fit = LaneFit(coeffs=np.array([0.0, 0.0, 1.75]), role="ego_right",
                       n_pixels=500, y_range_m=(5, 40))
         assert np.isinf(fit.curvature_radius_m(10.0))
 
     def test_radius_formula_matches_the_analytic_value(self) -> None:
-        from src.types import LaneFit
+        from core.types import LaneFit
 
         a = 0.001
         fit = LaneFit(coeffs=np.array([a, 0.0, 0.0]), role="x", n_pixels=1, y_range_m=(0, 1))
         assert fit.curvature_radius_m(0.0) == pytest.approx(1.0 / (2 * a))
 
     def test_infinite_radius_survives_json_round_trip(self) -> None:
-        from src.types import LaneSet
+        from core.types import LaneSet
 
         s = LaneSet(status=LaneStatus.OK, curvature_radius_m=float("inf"),
                     ego_offset_m=0.1, lane_width_m=3.5, eval_distance_m=10.0)
         assert np.isinf(LaneSet.from_dict(s.to_dict()).curvature_radius_m)
 
     def test_wrong_coefficient_count_raises(self) -> None:
-        from src.types import LaneFit
+        from core.types import LaneFit
 
         with pytest.raises(ValueError, match="3 polynomial coefficients"):
             LaneFit(coeffs=np.array([1.0, 2.0]), role="x", n_pixels=1, y_range_m=(0, 1))

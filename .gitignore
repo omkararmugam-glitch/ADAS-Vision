@@ -2,10 +2,27 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
-data/
-models/*.pt
-models/*.pth
-outputs/
-calib/*.npz
 .ipynb_checkpoints/
-calib/*.yaml
+
+# Datasets: supplied locally, never committed. The adapters in data/adapters/
+# are tracked; what they read and write is not.
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# Model weights: downloaded or trained, too large for git. The wrappers that
+# load them are tracked; the tensors are not.
+models/**/weights/*
+!models/**/weights/.gitkeep
+*.pt
+*.pth
+*.onnx
+
+# Calibration is machine- and mount-specific, and it is derived output --
+# regenerate it with `python run.py calibrate`.
+calib/*
+!calib/.gitkeep
+
+# Inference cache and rendered video.
+outputs/

@@ -17,15 +17,15 @@ import logging
 import sys
 from pathlib import Path
 
-from src.cache import RunCache
-from src.calibrate import CameraModel, file_sha256_of_text
-from src.config import Config, load_config
-from src.detect import Detector, build_detector
-from src.io import open_source
-from src.lanes import LaneFitter
-from src.logging_utils import StageTimer, get_logger, log_kv
-from src.overlay import VideoWriter, annotate, lane_hud_lines
-from src.types import FrameRecord, FrameResult, LaneStatus, class_name
+from core.cache import RunCache
+from core.calibrate import CameraModel, file_sha256_of_text
+from core.config import Config, load_config
+from models.perception import Detector, build_detector
+from core.io import open_source
+from models.lane_seg.fitting import LaneFitter
+from core.logging_utils import StageTimer, get_logger, log_kv
+from core.overlay import VideoWriter, annotate, lane_hud_lines
+from core.types import FrameRecord, FrameResult, LaneStatus, class_name
 
 _log = get_logger("run")
 
@@ -298,7 +298,7 @@ def _print_summary(
 
 def cmd_calibrate(args: argparse.Namespace) -> int:
     """Forward everything after ``calibrate`` to the calibration CLI."""
-    from src.calibrate import main as calibrate_main
+    from core.calibrate import main as calibrate_main
 
     return calibrate_main(["--config", args.config, *args.rest])
 
@@ -324,13 +324,13 @@ def build_parser() -> argparse.ArgumentParser:
     _common(p_pred)
     p_pred.add_argument("--refresh", action="store_true", help="discard any existing cache")
     p_pred.add_argument("--device", default=None, help="override detector.device")
-    p_pred.add_argument("--detector", default=None, choices=["stub", "yolopv2"])
+    p_pred.add_argument("--detector", default=None, choices=["stub", "yolopv2", "yolov8"])
     p_pred.set_defaults(func=cmd_predict)
 
     p_rend = sub.add_parser("render", help="annotate from the cache; loads no model")
     _common(p_rend)
     p_rend.add_argument("--out", default=None, help="annotated MP4 path")
-    p_rend.add_argument("--detector", default=None, choices=["stub", "yolopv2"])
+    p_rend.add_argument("--detector", default=None, choices=["stub", "yolopv2", "yolov8"])
     p_rend.set_defaults(func=cmd_render)
     return parser
 

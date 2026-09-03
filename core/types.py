@@ -12,7 +12,7 @@ Coordinate frames:
 
 Everything here round-trips through ``to_dict``/``from_dict`` so a frame can be
 cached and reloaded without re-running any model. Masks are the exception: they
-are bulk arrays and are persisted alongside the JSON by :mod:`src.cache`.
+are bulk arrays and are persisted alongside the JSON by :mod:`core.cache`.
 """
 
 from __future__ import annotations
@@ -65,7 +65,7 @@ class NativeMasks:
 
 @dataclass(frozen=True)
 class FrameResult:
-    """What a :class:`~src.detect.Detector` produced for one frame.
+    """What a :class:`~models.perception.Detector` produced for one frame.
 
     Attributes:
         boxes_px: ``(N, 4)`` float32 ``(x1, y1, x2, y2)`` in **original image

@@ -37,10 +37,10 @@ from typing import Any, Iterator
 import cv2
 import numpy as np
 
-from src.config import Config
-from src.detect import LetterboxTransform
-from src.logging_utils import get_logger, log_kv
-from src.types import SCHEMA_VERSION, FrameRecord, FrameResult
+from core.config import Config
+from core.letterbox import LetterboxTransform
+from core.logging_utils import get_logger, log_kv
+from core.types import SCHEMA_VERSION, FrameRecord, FrameResult
 
 _log = get_logger(__name__)
 

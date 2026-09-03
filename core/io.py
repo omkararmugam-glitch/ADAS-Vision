@@ -38,8 +38,8 @@ from types import TracebackType
 import cv2
 import numpy as np
 
-from src.config import IOConfig
-from src.logging_utils import get_logger, log_kv
+from core.config import IOConfig
+from core.logging_utils import get_logger, log_kv
 
 _log = get_logger(__name__)
 

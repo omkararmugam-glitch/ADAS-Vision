@@ -13,8 +13,8 @@ import cv2
 import numpy as np
 import pytest
 
-from src.config import IOConfig, load_config
-from src.io import Frame, ImageDirSource, VideoSource, open_source
+from core.config import IOConfig, load_config
+from core.io import Frame, ImageDirSource, VideoSource, open_source
 
 WIDTH, HEIGHT = 64, 48
 
