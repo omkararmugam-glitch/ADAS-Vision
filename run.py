@@ -2,6 +2,7 @@
 
     python run.py calibrate ...              # intrinsics / homography / verify
     python run.py predict --source <media>   # run models, populate the cache
+    python run.py analyse --source <media>   # cache -> tracks, TTC, alert log
     python run.py render  --source <media>   # cache -> annotated video
 
 ``predict`` and ``render`` are separate commands, not two halves of one, because
@@ -26,6 +27,10 @@ from models.lane_seg.fitting import LaneFitter
 from core.logging_utils import StageTimer, get_logger, log_kv
 from core.overlay import VideoWriter, annotate, lane_hud_lines
 from core.types import FrameRecord, FrameResult, LaneStatus, class_name
+from fusion.engine import DecisionEngine
+from fusion.log import AlertLog
+from tracking.bytetrack import ByteTracker
+from tracking.collision import CollisionEstimator
 
 _log = get_logger("run")
 
@@ -160,6 +165,88 @@ def cmd_predict(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# analyse
+# --------------------------------------------------------------------------- #
+
+
+def analyse_cache(cfg: Config, cache: RunCache, camera: CameraModel) -> AlertLog:
+    """Run tracking, collision estimation and the decision engine over a cache.
+
+    Loads no model: this is post-processing over detections that already exist,
+    which is why the tracker, TTC and fusion config sections are excluded from
+    the cache key. Retuning an alert threshold costs seconds, not an inference
+    run.
+    """
+    tracker = ByteTracker(cfg.tracker)
+    collisions = CollisionEstimator(cfg.ttc, camera)
+    engine = DecisionEngine(cfg.fusion)
+    log = AlertLog()
+
+    for record in cache.read(with_masks=False):
+        tracks = tracker.update(record.result, record.frame_index, record.timestamp_s)
+        objects = collisions.update(tracks, record.timestamp_s)
+        log.add(engine.update(
+            record.frame_index, record.timestamp_s, objects, record.lanes
+        ))
+    return log
+
+
+def cmd_analyse(args: argparse.Namespace) -> int:
+    cfg = _apply_overrides(load_config(args.config), args)
+    camera = _load_camera(cfg)
+    cache = _open_cache(cfg, args.source, camera, detector=None)
+
+    reason = cache.staleness_reason()
+    if reason is not None:
+        raise ValueError(
+            f"cannot analyse the cache at {cache.run_dir}: {reason}. "
+            f"Re-run `predict` to rebuild it."
+        )
+
+    frame_size = tuple(cache.existing_manifest().extra.get("frame_size", (0, 0)))
+    if frame_size != (0, 0):
+        camera = camera.for_image_size(frame_size)
+
+    with StageTimer("analyse", _log) as timer:
+        log = analyse_cache(cfg, cache, camera)
+        for _ in log.decisions:
+            timer.tick()
+
+    out_dir = Path(args.out_dir) if args.out_dir else cache.run_dir
+    json_path = log.write_json(out_dir / "alerts.json", source=str(args.source))
+    csv_path = log.write_csv(out_dir / "alerts.csv")
+    ep_path = log.write_episodes_csv(out_dir / "episodes.csv")
+
+    counts = log.counts_by_type()
+    episodes = log.episodes()
+    log_kv(_log, logging.INFO, "analyse.done",
+           frames=len(log.decisions), alerts=len(log.alerts), episodes=len(episodes))
+
+    print(chr(10) + "=" * 68)
+    print(f"analysed        : {len(log.decisions)} frames from {cache.run_dir}")
+    print(f"  alerts        : {len(log.alerts)} on individual frames")
+    print(f"  episodes      : {len(episodes)} distinct events")
+    if counts:
+        for k, v in sorted(counts.items()):
+            print(f"      {k:24s} {v:6d} frames")
+    else:
+        print("      (no alerts raised)")
+    if episodes:
+        print("  timeline      :")
+        for e in episodes[:20]:
+            tid = f" track {e.track_id}" if e.track_id is not None else ""
+            print(f"      {e.start_s:7.2f}-{e.end_s:6.2f}s  {e.type.value:20s}"
+                  f" {e.peak_severity.value:8s}{tid}")
+        if len(episodes) > 20:
+            print(f"      ... and {len(episodes) - 20} more")
+    print(f"  json          : {json_path}")
+    print(f"  csv           : {csv_path}")
+    print(f"  episodes csv  : {ep_path}")
+    print("=" * 68)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # render
 # --------------------------------------------------------------------------- #
 
@@ -180,6 +267,26 @@ def cmd_render(args: argparse.Namespace) -> int:
     out_path = Path(args.out) if args.out else cache.run_dir / "annotated.mp4"
     render_camera: CameraModel | None = None
     frame_size = tuple(cache.existing_manifest().extra.get("frame_size", (0, 0)))
+
+    # Tracking, TTC and alerts are recomputed here rather than read from a file,
+    # because they are post-processing over the same cache and cost seconds. That
+    # keeps `render` self-contained: it never depends on `analyse` having been run,
+    # and it still loads no model.
+    decisions: dict[int, object] = {}
+    objects_by_frame: dict[int, list] = {}
+    if not args.no_alerts:
+        alert_camera = camera.for_image_size(frame_size) if frame_size != (0, 0) else camera
+        tracker = ByteTracker(cfg.tracker)
+        collisions = CollisionEstimator(cfg.ttc, alert_camera)
+        engine = DecisionEngine(cfg.fusion)
+        for idx in sorted(records):
+            rec = records[idx]
+            tracks = tracker.update(rec.result, rec.frame_index, rec.timestamp_s)
+            objs = collisions.update(tracks, rec.timestamp_s)
+            objects_by_frame[idx] = objs
+            decisions[idx] = engine.update(
+                rec.frame_index, rec.timestamp_s, objs, rec.lanes
+            )
 
     with open_source(args.source, cfg.io) as src:
         fps = src.fps / cfg.io.stride
@@ -202,7 +309,9 @@ def cmd_render(args: argparse.Namespace) -> int:
                     drivable_mask=drivable,
                     lane_mask=lane,
                 )
-                hud, warnings = _hud(cfg, record, result)
+                hud, warnings = _hud(cfg, record, result,
+                                     decisions.get(frame.index),
+                                     objects_by_frame.get(frame.index, []))
                 writer.write(
                     annotate(frame.image, result, record.lanes, render_camera, cfg.overlay, hud, warnings)
                 )
@@ -214,13 +323,13 @@ def cmd_render(args: argparse.Namespace) -> int:
 
 
 def _hud(
-    cfg: Config, record: FrameRecord, result: FrameResult
+    cfg: Config,
+    record: FrameRecord,
+    result: FrameResult,
+    decision: object | None = None,
+    objects: list | None = None,
 ) -> tuple[list[str], list[str]]:
-    """HUD rows for one cached frame.
-
-    Object counts and lane geometry only. Distances, tracking and events are
-    Stage 3; nothing here computes them.
-    """
+    """HUD rows and warning banners for one cached frame."""
     by_class: dict[str, int] = {}
     for cid in result.class_ids:
         name = class_name(int(cid))
@@ -231,11 +340,33 @@ def _hud(
         f"frame {record.frame_index:>5}   t={record.timestamp_s:6.2f}s",
         f"objects: {summary}",
         *lane_hud_lines(record.lanes),
-        f"model  : {cfg.detector.kind}",
     ]
+
+    # The nearest in-path object is the one the driver needs a number for;
+    # listing every track would bury it.
+    nearest = None
+    for o in objects or []:
+        if not o.in_path or o.distance_m is None:
+            continue
+        if nearest is None or o.distance_m < nearest.distance_m:
+            nearest = o
+    if nearest is not None:
+        ttc = nearest.ttc.ttc_s
+        ttc_txt = f"{ttc:4.1f}s" if ttc != float("inf") else "  --"
+        lines.append(
+            f"lead   : #{nearest.track_id} {nearest.class_name} "
+            f"{nearest.distance_m:5.1f}m  ttc {ttc_txt} ({nearest.ttc.source})"
+        )
+
+    lines.append(f"model  : {cfg.detector.kind}")
+
     warnings: list[str] = []
     if record.lanes.status is LaneStatus.NOT_DETECTED:
         warnings.append("! NO LANE")
+    if decision is not None:
+        for a in decision.alerts:                      # already worst-first
+            prefix = "!! " if a.severity.value == "critical" else "!  "
+            warnings.append(f"{prefix}{a.message.upper()}")
     return lines, warnings
 
 
@@ -327,9 +458,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_pred.add_argument("--detector", default=None, choices=["stub", "yolopv2", "yolov8"])
     p_pred.set_defaults(func=cmd_predict)
 
+    p_ana = sub.add_parser(
+        "analyse", help="cache -> tracks, TTC and alert log; loads no model")
+    _common(p_ana)
+    p_ana.add_argument("--out-dir", default=None,
+                       help="where to write alerts.json/csv (default: the cache dir)")
+    p_ana.set_defaults(func=cmd_analyse)
+
     p_rend = sub.add_parser("render", help="annotate from the cache; loads no model")
     _common(p_rend)
     p_rend.add_argument("--out", default=None, help="annotated MP4 path")
+    p_rend.add_argument("--no-alerts", action="store_true",
+                        help="draw detections and lanes only, without running fusion")
     p_rend.add_argument("--detector", default=None, choices=["stub", "yolopv2", "yolov8"])
     p_rend.set_defaults(func=cmd_render)
     return parser

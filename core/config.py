@@ -253,7 +253,7 @@ class YOLOv8Config(_Strict):
             substituting the wrong weights is never the right default.
     """
 
-    weights: Path = Path("models/perception/weights/yolov8n.pt")
+    weights: Path = Path("models/perception/weights/yolov8m.pt")
     allow_download: bool = True
 
 
@@ -420,6 +420,271 @@ class VideoConfig(_Strict):
         return v
 
 
+class TrackerConfig(_Strict):
+    """ByteTrack association and track lifecycle.
+
+    Deliberately excluded from the cache key: tracking is post-processing over
+    cached detections, so retuning it re-runs association in seconds rather than
+    re-running the network.
+
+    Attributes:
+        enabled: Whether to assign persistent ids at all.
+        high_threshold: Detections at or above this drive the first association
+            pass and may start new tracks.
+        low_threshold: Floor for the second pass. Detections between the two
+            thresholds can only *continue* an existing track, never start one --
+            a partly occluded object scores low, but so does noise.
+        match_threshold: Minimum IoU for a first-pass match.
+        match_threshold_low: Minimum IoU for a second-pass match. Looser,
+            because a weak detection on a partly hidden object is also a
+            poorly-placed one.
+        new_track_threshold: Score needed to create a track.
+        n_init: Matches before a track is confirmed and reported.
+        max_age: Frames a confirmed track survives unmatched before removal. At
+            25-30 fps, 30 frames is about a second -- long enough to ride out a
+            vehicle passing behind a sign, short enough that an id is not still
+            reserved when an unrelated object appears in that spot.
+        use_mahalanobis_gate: Veto matches the motion model deems implausible,
+            even when the boxes overlap.
+    """
+
+    enabled: bool = True
+    high_threshold: float = 0.5
+    low_threshold: float = 0.1
+    match_threshold: float = 0.2
+    match_threshold_low: float = 0.4
+    new_track_threshold: float = 0.6
+    n_init: int = 3
+    max_age: int = 30
+    use_mahalanobis_gate: bool = True
+
+    @field_validator(
+        "high_threshold", "low_threshold", "match_threshold",
+        "match_threshold_low", "new_track_threshold",
+    )
+    @classmethod
+    def _unit(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError(f"must be in [0, 1], got {v}")
+        return v
+
+    @field_validator("n_init", "max_age")
+    @classmethod
+    def _positive(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"must be >= 1, got {v}")
+        return v
+
+    def model_post_init(self, _ctx: Any) -> None:
+        if self.low_threshold >= self.high_threshold:
+            raise ValueError(
+                f"low_threshold ({self.low_threshold}) must be below "
+                f"high_threshold ({self.high_threshold}); otherwise the "
+                f"second association pass has no detections to work with"
+            )
+        if self.new_track_threshold < self.high_threshold:
+            raise ValueError(
+                f"new_track_threshold ({self.new_track_threshold}) must be at "
+                f"least high_threshold ({self.high_threshold}): tracks are only "
+                f"ever created from first-pass detections"
+            )
+
+
+class TTCConfig(_Strict):
+    """Distance and time-to-collision estimation.
+
+    Post-processing over cached detections, so excluded from the cache key.
+
+    Attributes:
+        fit_window: Most recent samples the linear fits use. Short enough to
+            follow a real change in closing speed, long enough to average out
+            per-frame box jitter -- about half a second at 25-30 fps.
+        min_samples: Samples required before any estimate is made. Two points
+            define a line through any noise; more is needed to mean anything.
+        history_window: Cap on retained distance samples per track.
+        min_fit_quality: R-squared below which the scale estimate is discarded.
+            A poor fit means the object is not moving the way the constant-
+            velocity model assumes, and the arithmetic would carry no meaning.
+        prefer_range_within_m: Below this distance the calibrated ground-plane
+            estimate is preferred; beyond it, scale expansion is. Pixel
+            quantisation makes homography distance unreliable far out, while
+            scale expansion needs no calibration at all.
+        corridor_half_width_m: Half-width of the ego corridor at zero distance.
+            Slightly wider than a half lane, since a vehicle straddling a line
+            is still a hazard.
+        corridor_widening: Extra corridor half-width per metre of distance. This
+            compensates for lateral-estimate error growing with range, not for
+            the road getting wider.
+    """
+
+    fit_window: int = 15
+    min_samples: int = 4
+    history_window: int = 60
+    min_fit_quality: float = 0.5
+    prefer_range_within_m: float = 30.0
+    corridor_half_width_m: float = 1.6
+    corridor_widening: float = 0.02
+
+    @field_validator("fit_window", "min_samples", "history_window")
+    @classmethod
+    def _positive(cls, v: int) -> int:
+        if v < 2:
+            raise ValueError(f"must be >= 2, got {v}")
+        return v
+
+    @field_validator("min_fit_quality")
+    @classmethod
+    def _unit(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError(f"must be in [0, 1], got {v}")
+        return v
+
+    @field_validator("prefer_range_within_m", "corridor_half_width_m")
+    @classmethod
+    def _positive_float(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError(f"must be > 0, got {v}")
+        return v
+
+    def model_post_init(self, _ctx: Any) -> None:
+        if self.min_samples > self.fit_window:
+            raise ValueError(
+                f"min_samples ({self.min_samples}) exceeds fit_window "
+                f"({self.fit_window}), so no fit could ever run"
+            )
+        if self.history_window < self.fit_window:
+            raise ValueError(
+                f"history_window ({self.history_window}) is smaller than "
+                f"fit_window ({self.fit_window}); the fit would be starved"
+            )
+
+
+class LaneChangeConfig(_Strict):
+    """Lane departure and lane-change detection.
+
+    Thresholds are on the *normalised* offset -- offset divided by half the lane
+    width -- so 1.0 is a boundary regardless of whether the lane is a 3.7 m
+    motorway lane or a 2.6 m urban one.
+
+    Attributes:
+        departure_threshold: Normalised offset at which the vehicle counts as
+            riding a boundary. 0.65 is roughly two-thirds of the way out.
+        recover_threshold: Offset the vehicle must return inside before a new
+            departure can be reported. Deliberately lower than
+            ``departure_threshold``: without that hysteresis, a vehicle sitting
+            near the limit would re-trigger every few frames.
+        min_departure_frames: Consecutive frames above the threshold before a
+            departure fires. Rejects single-frame fit wobble.
+        cross_threshold: Magnitude both sides of the sign flip must reach for a
+            crossing to be believed.
+        cooldown_frames: Frames after a change during which no new lane event
+            fires, while the fitter settles onto the new lane.
+        max_gap_frames: How long a departure survives with no usable lane fit.
+            Markings vanish briefly all the time; forgetting instantly would
+            drop a departure that is still happening.
+        history_window: Offsets retained, for the confidence figure.
+        min_plausible_width_m, max_plausible_width_m: A fit outside this band is
+            rejected as a mis-lock rather than trusted.
+    """
+
+    departure_threshold: float = 0.65
+    recover_threshold: float = 0.45
+    min_departure_frames: int = 3
+    cross_threshold: float = 0.5
+    cooldown_frames: int = 15
+    max_gap_frames: int = 5
+    history_window: int = 60
+    min_plausible_width_m: float = 2.2
+    max_plausible_width_m: float = 5.0
+
+    @field_validator("departure_threshold", "recover_threshold", "cross_threshold")
+    @classmethod
+    def _positive_unit(cls, v: float) -> float:
+        if not 0.0 < v <= 2.0:
+            raise ValueError(f"must be in (0, 2], got {v}")
+        return v
+
+    @field_validator("min_departure_frames", "cooldown_frames", "max_gap_frames",
+                     "history_window")
+    @classmethod
+    def _non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(f"must be >= 0, got {v}")
+        return v
+
+    def model_post_init(self, _ctx: Any) -> None:
+        if self.recover_threshold >= self.departure_threshold:
+            raise ValueError(
+                f"recover_threshold ({self.recover_threshold}) must be below "
+                f"departure_threshold ({self.departure_threshold}) to give the "
+                f"state machine hysteresis; equal values re-trigger every frame"
+            )
+        if self.min_plausible_width_m >= self.max_plausible_width_m:
+            raise ValueError("min_plausible_width_m must be below max_plausible_width_m")
+
+
+class FusionConfig(_Strict):
+    """Rules-based decision engine thresholds.
+
+    Post-processing, so excluded from the cache key: retuning an alert threshold
+    must never re-run inference.
+
+    Attributes:
+        ttc_warning_s: TTC at or below which a forward-collision warning fires.
+            2.5 s is roughly driver reaction time plus a margin.
+        ttc_critical_s: TTC for a critical warning -- too late to be comfortable,
+            still time to brake.
+        pedestrian_distance_m: A vulnerable road user in the corridor closer
+            than this alerts on proximity alone, regardless of TTC. A pedestrian
+            standing still has infinite TTC and is still a hazard.
+        weather_ttc_factor: Multiplier on both TTC thresholds per weather label.
+            Wet tarmac roughly doubles stopping distance, so the warning has to
+            arrive proportionally earlier. Labels absent from this map use 1.0.
+        warn_on_lane_loss: Emit an informational alert when no lane is fitted.
+        lane_change: Lane event detection settings.
+    """
+
+    ttc_warning_s: float = 2.5
+    ttc_critical_s: float = 1.2
+    pedestrian_distance_m: float = 12.0
+    weather_ttc_factor: dict[str, float] = Field(
+        default_factory=lambda: {
+            "clear": 1.0, "cloudy": 1.0, "night": 1.2,
+            "rain": 1.6, "snow": 2.0, "fog": 1.8,
+        }
+    )
+    warn_on_lane_loss: bool = False
+    lane_change: LaneChangeConfig = Field(default_factory=LaneChangeConfig)
+
+    @field_validator("ttc_warning_s", "ttc_critical_s", "pedestrian_distance_m")
+    @classmethod
+    def _positive(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError(f"must be > 0, got {v}")
+        return v
+
+    @field_validator("weather_ttc_factor")
+    @classmethod
+    def _sane_factors(cls, v: dict[str, float]) -> dict[str, float]:
+        for k, f in v.items():
+            if f <= 0:
+                raise ValueError(f"weather_ttc_factor['{k}'] must be > 0, got {f}")
+            if f < 1.0:
+                raise ValueError(
+                    f"weather_ttc_factor['{k}'] is {f}: a factor below 1 would "
+                    f"make the warning fire LATER in worse conditions"
+                )
+        return v
+
+    def model_post_init(self, _ctx: Any) -> None:
+        if self.ttc_critical_s >= self.ttc_warning_s:
+            raise ValueError(
+                f"ttc_critical_s ({self.ttc_critical_s}) must be below "
+                f"ttc_warning_s ({self.ttc_warning_s}); otherwise a critical "
+                f"alert could never fire before the warning"
+            )
+
+
 class Config(_Strict):
     """Root config. Sections are added as pipeline stages land."""
 
@@ -429,12 +694,18 @@ class Config(_Strict):
     cache: CacheConfig = Field(default_factory=CacheConfig)
     detector: DetectorConfig = Field(default_factory=DetectorConfig)
     lanes: LaneFitConfig = Field(default_factory=LaneFitConfig)
+    tracker: TrackerConfig = Field(default_factory=TrackerConfig)
+    ttc: TTCConfig = Field(default_factory=TTCConfig)
+    fusion: FusionConfig = Field(default_factory=FusionConfig)
     overlay: OverlayConfig = Field(default_factory=OverlayConfig)
     video: VideoConfig = Field(default_factory=VideoConfig)
 
-    #: Sections whose values change cached per-frame results. Presentation-only
-    #: sections are deliberately absent: restyling the overlay must not
-    #: invalidate an expensive cache.
+    #: Sections whose values change cached per-frame results. Two kinds of
+    #: section are deliberately absent. Presentation-only ones, because
+    #: restyling the overlay must not invalidate an expensive cache. And the
+    #: post-processing ones -- `tracker`, and later TTC and fusion -- because
+    #: they run over cached detections in seconds; retuning an alert threshold
+    #: must never re-run a network.
     CACHE_KEY_SECTIONS: ClassVar[tuple[str, ...]] = ("io", "calibration", "bev", "detector", "lanes")
 
     def cache_key_payload(self) -> dict[str, Any]:

@@ -16,10 +16,10 @@
 | 3 | YOLOv8 baseline | **working** on COCO-pretrained weights; not fine-tuned |
 | 3 | Weather classifier | placeholder |
 | 3 | Pothole detector | placeholder |
-| 4 | ByteTrack tracking | placeholder |
+| 4 | ByteTrack tracking | **done** |
 | 4 | MiDaS depth | placeholder |
-| 4 | Lane-change detection, TTC | not started |
-| 5 | Fusion / decision engine | placeholder |
+| 4 | Lane-change detection, TTC | **done** |
+| 5 | Fusion / decision engine | **done** |
 | 7 | Evaluation scripts | placeholder |
 | 8 | ONNX export, FPS benchmark, dashboard | not started |
 
@@ -167,6 +167,72 @@ and the coefficients are absent. Returning a garbage polynomial that downstream
 code treats as real is the failure mode this design exists to prevent.
 
 ---
+
+## Post-processing is not inference
+
+`tracker`, `ttc` and `fusion` are deliberately **excluded from the cache key**.
+They run over cached detections at roughly 4,000 frames/second, so retuning an
+alert threshold and re-deriving every event across a clip costs well under a
+second — no network re-run. This is the same principle as the `predict`/`render`
+split, extended to the decision layer:
+
+```bash
+python run.py predict --source drive.mp4   # expensive, cached
+python run.py analyse --source drive.mp4   # tracks, TTC, alerts. No model.
+python run.py render  --source drive.mp4   # annotated video. No model.
+```
+
+`analyse` writes three files beside the cache: `alerts.json` (every frame, plus
+an episode summary), `alerts.csv` (one row per alert), and `episodes.csv`.
+
+**Episodes, not frames.** A collision warning that holds for 90 frames is one
+event a driver experienced, not 90. Scoring per frame would let a single long
+warning dominate the metrics, so `eval/` compares episodes against the labelled
+intervals in `DATASET_FORMAT.md`.
+
+## Time-to-collision
+
+Two independent estimators, because they fail differently and disagreement is
+itself information.
+
+**Scale expansion** needs no calibration. Under a pinhole camera `h = f·H/Z`, so
+`1/h` is proportional to distance and — at constant closing speed — falls
+*linearly* to zero at contact. The fit is therefore done in inverse-height space,
+where a straight line is the exact model rather than an approximation.
+Differentiating a noisy height directly gives a wildly unstable TTC; this does
+not.
+
+**Ground-plane range** back-projects the box's bottom-centre through the
+homography and fits distance against time. Gives metres, but inherits the
+flat-road assumption.
+
+Ground-plane range is preferred within 30 m, scale expansion beyond it. The two
+are **never averaged**: when they disagree it is because an assumption has
+broken, and averaging would hide exactly the case worth flagging, so the gap is
+recorded as `disagreement_s` instead.
+
+Validated against an analytic scenario (lead vehicle at 45 m closing at 8 m/s):
+distance error 0.038 m mean / 0.10 m max, TTC error 0.008 s mean / 0.016 s max,
+and the warning fired within one frame of the analytically correct moment. Those
+figures are for exact synthetic boxes on perfectly flat ground — they validate
+the *geometry*, and say nothing about real-world accuracy, which is dominated by
+the error sources tabulated above.
+
+## Lane departure and lane change
+
+Both from one signal: lateral offset normalised by half the lane width, so
+`|u| = 1` is a boundary whether the lane is 3.7 m or 2.6 m wide.
+
+They are different kinds of thing and are detected differently. A **departure**
+is a sustained state — `|u|` high for several consecutive frames. A **lane
+change** is an event, and it announces itself by a *sign flip*: as the vehicle
+crosses, the fitter re-locks onto the new lane and the offset jumps from "far
+right of the old lane" to "left of the new one". Requiring a preceding sustained
+departure in the matching direction is what stops a single frame's fit wobble
+from reading as a lane change.
+
+Hysteresis (`recover_threshold` below `departure_threshold`) stops a vehicle
+riding near the limit from re-triggering every few frames.
 
 ## Tracking — ByteTrack over DeepSORT
 
