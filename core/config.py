@@ -236,12 +236,34 @@ class VRUConfig(_Strict):
         return v
 
 
+class YOLOv8Config(_Strict):
+    """Single-task YOLOv8 baseline settings.
+
+    Separate from the top-level ``weights`` because the two backbones take
+    different checkpoints, and sharing one field would silently hand YOLOv8 the
+    YOLOPv2 weights when ``kind`` is switched.
+
+    Attributes:
+        weights: Checkpoint path. A COCO-pretrained ``yolov8*.pt`` gives a
+            working baseline with no training; a fine-tuned checkpoint replaces
+            it without any other change.
+        allow_download: Whether a missing *standard* pretrained checkpoint may be
+            fetched by ultralytics. A missing checkpoint that is not a recognised
+            pretrained name always raises -- silently training-from-scratch or
+            substituting the wrong weights is never the right default.
+    """
+
+    weights: Path = Path("models/perception/weights/yolov8n.pt")
+    allow_download: bool = True
+
+
 class DetectorConfig(_Strict):
     """Perception model settings.
 
     Attributes:
-        kind: ``"yolopv2"`` for the real backbone, ``"stub"`` for the synthetic
-            detector that keeps pipeline tests fast and model-free.
+        kind: ``"yolopv2"`` for the multi-task backbone, ``"yolov8"`` for the
+            single-task baseline, ``"stub"`` for the synthetic detector that
+            keeps pipeline tests fast and model-free.
         weights: TorchScript weights path for the real backbone.
         input_size: Network input size for the longer image side. The letterbox
             pads to a multiple of ``stride`` from there.
@@ -256,7 +278,10 @@ class DetectorConfig(_Strict):
         batch_size: Frames per forward pass.
         score_threshold: Stub only -- fake detections below this are dropped.
         seed: Stub only -- makes the fake output deterministic.
-        vru: Second-detector settings.
+        vru: Second-detector settings. Ignored when ``kind`` is ``"yolov8"``,
+            which detects vulnerable road users itself.
+        yolov8: Baseline-backbone settings, used only when ``kind`` is
+            ``"yolov8"``.
     """
 
     kind: str = "yolopv2"
@@ -273,12 +298,16 @@ class DetectorConfig(_Strict):
     score_threshold: float = 0.3
     seed: int = 0
     vru: VRUConfig = Field(default_factory=VRUConfig)
+    yolov8: YOLOv8Config = Field(default_factory=YOLOv8Config)
 
     @field_validator("kind")
     @classmethod
     def _known_kind(cls, v: str) -> str:
-        if v not in ("stub", "yolopv2"):
-            raise ValueError(f"unknown detector kind '{v}'; expected 'stub' or 'yolopv2'")
+        known = ("stub", "yolopv2", "yolov8")
+        if v not in known:
+            raise ValueError(
+                f"unknown detector kind '{v}'; expected one of {', '.join(known)}"
+            )
         return v
 
     @field_validator("input_size", "stride", "batch_size", "max_detections")

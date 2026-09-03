@@ -73,10 +73,20 @@ detector:
   # Stub-only knobs, ignored by the real backbone.
   score_threshold: 0.3
   seed: 0
+  # Baseline backbone, used only when kind == 'yolov8'. It detects people
+  # itself, so no VRU model is attached to it, and it emits no masks -- lanes
+  # on that path come from models/lane_seg.
+  yolov8:
+    weights: models/perception/weights/yolov8n.pt
+    # A missing checkpoint is fetched only when it is a standard pretrained
+    # name. Anything else raises rather than quietly running other weights.
+    allow_download: true
+
   # YOLOPv2 has no pedestrian class, and no released multi-task network in that
   # family does (HybridNets ships obj_list:['car']). Vulnerable road users
   # therefore need a second model. It emits ONLY person/bicycle/motorcycle --
   # vehicles come from YOLOPv2, and taking them from both would double-count.
+  # Ignored when kind == 'yolov8'.
   vru:
     enabled: true
     architecture: fasterrcnn_mobilenet_v3_large_320_fpn

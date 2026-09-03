@@ -13,7 +13,7 @@
 | 2 | Lane fitting in bird's-eye metres | **done** |
 | 2 | Overlay + annotated video | **done** |
 | 3 | Dataset adapters | spec written, blocked on a dataset sample |
-| 3 | YOLOv8 baseline | placeholder — `models/perception/yolov8.py` |
+| 3 | YOLOv8 baseline | **working** on COCO-pretrained weights; not fine-tuned |
 | 3 | Weather classifier | placeholder |
 | 3 | Pothole detector | placeholder |
 | 4 | ByteTrack tracking | placeholder |

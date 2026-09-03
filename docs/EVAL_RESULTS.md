@@ -1,9 +1,12 @@
 # Evaluation results
 
-**Nothing here is measured yet.** This file is the shape the results will take,
-so that the metrics are agreed before any model is trained and there is no
-temptation to pick a favourable one afterwards. Every table below is empty on
-purpose; each gets filled in build step 3 (per-module) and step 7 (end-to-end).
+**Only §7 (inference speed) has measurements so far.** Everything else is
+accuracy, and accuracy needs a dataset that has not been supplied yet.
+
+The empty tables are deliberate and are written first: agreeing the metrics
+before any model is trained removes the temptation to pick a favourable one
+afterwards. They get filled in at build step 3 (per-module) and step 7
+(end-to-end).
 
 Populated by scripts in `eval/`. Every row must record the exact checkpoint and
 the dataset split it was measured on — a number without both is not a result.
@@ -105,13 +108,26 @@ flat-ground assumption is violated badly enough to matter.
 
 ## 7. Inference speed
 
-| Configuration | Resolution | FPS | GPU mem | Notes |
-|---|---|---|---|---|
-| YOLOPv2 only | — | — | — | — |
-| YOLOPv2 + VRU | — | — | — | — |
-| YOLOv8 baseline + lane model | — | — | — | — |
-| Full pipeline (+ tracking + depth + fusion) | — | — | — | — |
-| Full pipeline, ONNX | — | — | — | — |
+Measured on the target machine: RTX 5050 Laptop (8 GB), fp16, 1280x720 input
+letterboxed to 640 long side.
+
+| Configuration | Batch | FPS | ms/frame | GPU mem | Notes |
+|---|---|---|---|---|---|
+| YOLOv8n (detection only) | 1 | **134** | 7.45 | 65 MiB | measured 2026-09-03 |
+| YOLOv8n (detection only) | 4 | **378** | 2.65 | 65 MiB | measured 2026-09-03 |
+| YOLOv8n (detection only) | 8 | **455** | 2.20 | 65 MiB | measured 2026-09-03 |
+| YOLOPv2 only | — | — | — | — | — |
+| YOLOPv2 + VRU | — | — | — | — | — |
+| YOLOv8 baseline + lane model | — | — | — | — | — |
+| Full pipeline (+ tracking + depth + fusion) | — | — | — | — | — |
+| Full pipeline, ONNX | — | — | — | — | — |
+
+Two caveats on the YOLOv8n rows, so they are not read as more than they are.
+They were measured on **random-noise frames**, which yield almost no detections
+and therefore almost no NMS work; a busy real scene will be slower. And this is
+the **nano** model — the smallest of the family, chosen as a starting point, not
+as the accuracy-optimal choice. The 65 MiB figure is why: it leaves essentially
+the whole 8 GB budget for MiDaS and the tracker, which is the real constraint.
 
 The baseline-vs-multi-task comparison is the point of build step 6. Expect the
 full pipeline to be memory-bound on 8 GB rather than compute-bound.

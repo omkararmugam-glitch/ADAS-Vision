@@ -13,11 +13,14 @@ numpy>=2.0
 pyyaml>=6.0
 pydantic>=2.9
 
+# YOLOv8 baseline backbone. 8.4 renamed the fp16 flag half -> quantize; the
+# wrapper probes for both, so an older 8.3 still works.
+ultralytics>=8.3
+
 # Test suite.
 pytest>=8.0
 
 # --- Added per build stage; not yet required by the code on this branch. ---
-# ultralytics>=8.3      # step 3: YOLOv8 baseline + pothole detector
 # timm>=1.0             # step 3/4: weather classifier backbones, MiDaS/DPT
 # scipy>=1.14           # step 4: ByteTrack Hungarian assignment
 # pandas>=2.2           # step 7: metrics tables
