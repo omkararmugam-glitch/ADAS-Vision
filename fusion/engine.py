@@ -20,7 +20,7 @@ testable with no video, no GPU and no weights.
 from __future__ import annotations
 
 from core.config import FusionConfig
-from core.types import LaneSet, LaneStatus
+from core.types import ROAD_USER_CLASSES, LaneSet, LaneStatus
 from fusion.alerts import Alert, AlertType, FrameDecision, Severity
 from fusion.lane_change import LaneChangeDetector, LaneEvent, LaneState
 from tracking.collision import ObjectState
@@ -73,6 +73,7 @@ class DecisionEngine:
         alerts.extend(
             self._collision_alerts(frame_index, timestamp_s, objects, warn_s, crit_s)
         )
+        alerts.extend(self._signal_alerts(frame_index, timestamp_s, objects))
 
         # Most urgent first, so an overlay that shows only one shows the worst.
         alerts.sort(key=lambda a: -a.severity.rank)
@@ -138,6 +139,11 @@ class DecisionEngine:
         for obj in objects:
             if not obj.in_path:
                 continue
+            # A traffic light is never an obstacle. Without this the collision
+            # logic would warn about hitting a signal gantry, since a light
+            # directly ahead sits in the corridor and grows as you approach it.
+            if obj.class_name not in ROAD_USER_CLASSES:
+                continue
             ttc = obj.ttc.ttc_s
             vulnerable = obj.class_name in VULNERABLE
 
@@ -165,6 +171,60 @@ class DecisionEngine:
                 message=f"Collision risk: {ttc:.1f}s to {obj.class_name}",
                 track_id=obj.track_id,
                 evidence=self._evidence(obj),
+            ))
+        return out
+
+    def _signal_alerts(
+        self, frame_index: int, timestamp_s: float, objects: list[ObjectState]
+    ) -> list[Alert]:
+        """Warn when approaching a red light that is not being stopped for.
+
+        Three conditions must hold together, and each excludes a common false
+        alarm:
+
+        * the light reads **red** with enough confidence to act on -- an
+          unreadable lamp is never treated as red;
+        * it is **close enough to matter**, so a red two junctions away is
+          ignored;
+        * the vehicle is **not already slowing**, judged by the light's range
+          rate. Approaching a red while braking is normal driving, and warning
+          about it is exactly the noise that makes drivers switch a system off.
+
+        Traffic lights are not tracked as road users, so their distance comes
+        from the same geometry as any other object -- with the caveat that a
+        light is *above* the road plane, so the homography's flat-ground
+        assumption does not hold for it. The distance is therefore treated as
+        indicative and the threshold kept generous.
+        """
+        out: list[Alert] = []
+        if not self.cfg.warn_on_red_light:
+            return out
+        for obj in objects:
+            if obj.class_name != "traffic_light" or obj.light_state is None:
+                continue
+            state = obj.light_state
+            if not (state.is_red and state.is_actionable):
+                continue
+            d = obj.distance_m
+            if d is not None and d > self.cfg.red_light_distance_m:
+                continue
+            rate = obj.ttc.range_rate_mps
+            if rate is not None and rate > -self.cfg.red_light_min_closing_mps:
+                continue        # already slowing, or not approaching
+            out.append(Alert(
+                type=AlertType.RED_LIGHT_RUNNING,
+                severity=Severity.CRITICAL,
+                frame_index=frame_index, timestamp_s=timestamp_s,
+                message="Red light ahead",
+                track_id=obj.track_id,
+                evidence={
+                    "light_colour": state.colour,
+                    "light_confidence": state.confidence,
+                    "distance_m": d,
+                    "range_rate_mps": rate,
+                    "note": "traffic lights sit above the road plane, so the "
+                            "homography distance is indicative only",
+                },
             ))
         return out
 

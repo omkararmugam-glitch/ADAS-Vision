@@ -25,14 +25,37 @@ import numpy as np
 
 #: Bumped whenever the on-disk serialisation changes. A cache written under a
 #: different value is stale and is never reused.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+# v3 appended traffic_light and traffic_sign to CLASS_NAMES. A v2 cache saw
+# neither, and reading one as v3 would imply the run had looked for signals and
+# found none -- silently turning "never checked" into "checked, nothing there".
 
 #: Unified class vocabulary across every detector in the pipeline. YOLOPv2
 #: supplies vehicles only; vulnerable road users come from a second COCO model.
 #: The vocabulary is recorded in the cache manifest so that a cached run is never
 #: ambiguous about which classes it was *able* to see.
-CLASS_NAMES: tuple[str, ...] = ("vehicle", "person", "bicycle", "motorcycle")
+#: Traffic control is appended rather than inserted, so existing class ids keep
+#: their meaning and only the cache schema version has to move. Light colour is a
+#: separate axis (see TRAFFIC_LIGHT_COLOURS) rather than three more classes: the
+#: detector's job is finding the lamp housing, which looks the same whatever it
+#: is showing, and colour is then read from the pixels inside the box.
+CLASS_NAMES: tuple[str, ...] = (
+    "vehicle", "person", "bicycle", "motorcycle", "traffic_light", "traffic_sign",
+)
 CLASS_IDS: dict[str, int] = {name: i for i, name in enumerate(CLASS_NAMES)}
+
+#: Classes that are road users -- things that move and can be collided with.
+#: Traffic control is deliberately excluded: a traffic light is never an
+#: obstacle, and feeding it to the collision logic would raise warnings about
+#: hitting a signal gantry.
+ROAD_USER_CLASSES: frozenset[str] = frozenset(
+    {"vehicle", "person", "bicycle", "motorcycle"}
+)
+
+#: Recognised traffic-light states. `unknown` is a real answer, not a failure:
+#: a lamp too small or too washed out to read must not be guessed at, because a
+#: wrong `green` is worse than no reading.
+TRAFFIC_LIGHT_COLOURS: tuple[str, ...] = ("red", "amber", "green", "unknown")
 
 
 def class_name(class_id: int) -> str:

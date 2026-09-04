@@ -62,11 +62,14 @@ class YOLOv8Detector(Detector):
     """Ultralytics YOLOv8, mapped onto this project's class vocabulary.
 
     COCO's three vehicle categories collapse to one ``vehicle`` class, matching
-    what YOLOPv2 emits, so the two backbones stay directly comparable. COCO
-    classes outside the project vocabulary (traffic lights, stop signs) are
-    dropped here rather than silently renumbered -- adding them is a change to
-    ``core/types.py:CLASS_NAMES`` and to the cache schema, not a change to this
-    mapping alone.
+    what YOLOPv2 emits, so the two backbones stay directly comparable.
+
+    COCO's ``traffic light`` and ``stop sign`` map onto the project's traffic
+    control classes. Note the asymmetry that creates: COCO knows exactly one
+    kind of sign, so ``traffic_sign`` from this detector means "a stop sign",
+    while the same class from a BDD100K-trained model means any sign. The
+    manifest records which detector produced a run, so the two are never
+    silently mixed.
     """
 
     #: COCO class index -> this project's class name. car/bus/truck all become
@@ -78,6 +81,8 @@ class YOLOv8Detector(Detector):
         3: "motorcycle",
         5: "vehicle",   # bus
         7: "vehicle",   # truck
+        9: "traffic_light",
+        11: "traffic_sign",   # COCO's only sign class is the stop sign
     }
 
     @classmethod
@@ -102,8 +107,8 @@ class YOLOv8Detector(Detector):
             return {i: n for i, n in lowered.items()}
 
         # Stock COCO, verified by name rather than by index.
-        coco_expected = {0: "person", 1: "bicycle", 2: "car",
-                         3: "motorcycle", 5: "bus", 7: "truck"}
+        coco_expected = {0: "person", 1: "bicycle", 2: "car", 3: "motorcycle",
+                         5: "bus", 7: "truck", 9: "traffic light", 11: "stop sign"}
         if all(lowered.get(i) == n for i, n in coco_expected.items()):
             return dict(cls.COCO_TO_CLASS)
 

@@ -18,6 +18,8 @@ import logging
 import sys
 from pathlib import Path
 
+import numpy as np
+
 from core.cache import RunCache
 from core.calibrate import CameraModel, file_sha256_of_text
 from core.config import Config, load_config
@@ -26,8 +28,9 @@ from core.io import open_source
 from models.lane_seg.fitting import LaneFitter
 from core.logging_utils import StageTimer, get_logger, log_kv
 from core.overlay import VideoWriter, annotate, lane_hud_lines
-from core.types import FrameRecord, FrameResult, LaneStatus, class_name
+from core.types import CLASS_IDS, FrameRecord, FrameResult, LaneStatus, class_name
 from fusion.engine import DecisionEngine
+from models.perception.traffic_light import LightState, classify_lights
 from models.weather_cls.classifier import WeatherClassifier
 from fusion.log import AlertLog
 from tracking.bytetrack import ByteTracker
@@ -84,6 +87,29 @@ def _open_cache(cfg: Config, source: str, camera: CameraModel, detector: Detecto
 # --------------------------------------------------------------------------- #
 # predict
 # --------------------------------------------------------------------------- #
+
+
+def _light_readings(image, result: FrameResult) -> list[dict]:
+    """Read the state of every traffic light in one frame.
+
+    Returns a list of ``{box, colour, confidence}``, one per traffic-light
+    detection, in detection order. The box travels with the reading so that
+    `analyse` can attach a colour to the right track by overlap -- detection
+    order alone would not survive tracking.
+    """
+    light_id = CLASS_IDS.get("traffic_light")
+    if light_id is None or len(result) == 0:
+        return []
+    idx = np.flatnonzero(np.asarray(result.class_ids) == light_id)
+    if idx.size == 0:
+        return []
+    boxes = np.asarray(result.boxes_px)[idx]
+    states = classify_lights(image, boxes)
+    return [
+        {"box": [round(float(v), 1) for v in b],
+         "colour": st.colour, "confidence": round(st.confidence, 3)}
+        for b, st in zip(boxes, states)
+    ]
 
 
 def _build_weather(cfg: Config) -> WeatherClassifier | None:
@@ -147,6 +173,9 @@ def cmd_predict(args: argparse.Namespace) -> int:
                     lanes = fitter.fit(result.lane_mask)
                     if weather is not None and frame.index % cfg.weather.every_n_frames == 0:
                         nonlocal_weather = weather.infer_smoothed(frame.image).fusion_label
+                    # Colour needs pixels, which only this stage has. Cached
+                    # alongside the box so `analyse` never reopens the video.
+                    lights = _light_readings(frame.image, result)
                     for cid in result.class_ids:
                         name = class_name(int(cid))
                         counts[name] = counts.get(name, 0) + 1
@@ -161,7 +190,8 @@ def cmd_predict(args: argparse.Namespace) -> int:
                             result=result,
                             lanes=lanes,
                             extras={"was_resized": frame.was_resized,
-                                    "weather": nonlocal_weather},
+                                    "weather": nonlocal_weather,
+                                    "lights": lights},
                         ),
                         result,
                     )
@@ -221,10 +251,43 @@ def analyse_cache(cfg: Config, cache: RunCache, camera: CameraModel) -> AlertLog
         engine.set_weather(record.extras.get("weather", "unknown"))
         tracks = tracker.update(record.result, record.frame_index, record.timestamp_s)
         objects = collisions.update(tracks, record.timestamp_s)
+        objects = _attach_light_states(objects, record.extras.get("lights", []))
         log.add(engine.update(
             record.frame_index, record.timestamp_s, objects, record.lanes
         ))
     return log
+
+
+def _attach_light_states(objects: list, lights: list[dict]) -> list:
+    """Attach cached colour readings to the traffic-light objects they belong to.
+
+    Matched by box overlap rather than by index: the tracker reorders objects and
+    drops unconfirmed ones, so detection order does not survive it. An unmatched
+    light keeps ``light_state=None``, which the engine reads as "not readable"
+    and never as green.
+    """
+    from dataclasses import replace
+
+    from models.perception.traffic_light import LightState
+    from tracking.bytetrack import iou_matrix
+
+    if not lights:
+        return objects
+    boxes = np.asarray([l["box"] for l in lights], dtype=np.float64)
+    out = []
+    for obj in objects:
+        if obj.class_name != "traffic_light":
+            out.append(obj)
+            continue
+        ious = iou_matrix(np.asarray(obj.box_px).reshape(1, 4), boxes)[0]
+        best = int(np.argmax(ious))
+        if ious[best] < 0.3:
+            out.append(obj)
+            continue
+        rec = lights[best]
+        out.append(replace(obj, light_state=LightState(
+            colour=rec["colour"], confidence=float(rec["confidence"]))))
+    return out
 
 
 def cmd_analyse(args: argparse.Namespace) -> int:

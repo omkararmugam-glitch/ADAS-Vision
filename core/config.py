@@ -641,6 +641,14 @@ class FusionConfig(_Strict):
             Wet tarmac roughly doubles stopping distance, so the warning has to
             arrive proportionally earlier. Labels absent from this map use 1.0.
         warn_on_lane_loss: Emit an informational alert when no lane is fitted.
+        warn_on_red_light: Warn when approaching a red light without slowing.
+        red_light_distance_m: Ignore reds beyond this. Generous, because a
+            traffic light sits *above* the road plane and the homography's
+            flat-ground assumption does not hold for it, so its distance is
+            indicative rather than precise.
+        red_light_min_closing_mps: Minimum closing speed before a red warns.
+            Approaching a red while braking is normal driving; warning about it
+            is exactly the noise that makes a driver switch the system off.
         lane_change: Lane event detection settings.
     """
 
@@ -654,9 +662,13 @@ class FusionConfig(_Strict):
         }
     )
     warn_on_lane_loss: bool = False
+    warn_on_red_light: bool = True
+    red_light_distance_m: float = 45.0
+    red_light_min_closing_mps: float = 1.0
     lane_change: LaneChangeConfig = Field(default_factory=LaneChangeConfig)
 
-    @field_validator("ttc_warning_s", "ttc_critical_s", "pedestrian_distance_m")
+    @field_validator("ttc_warning_s", "ttc_critical_s", "pedestrian_distance_m",
+                     "red_light_distance_m", "red_light_min_closing_mps")
     @classmethod
     def _positive(cls, v: float) -> float:
         if v <= 0:

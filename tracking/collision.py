@@ -8,6 +8,7 @@ a calibrated camera is available and tracking must work without one.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 
@@ -34,6 +35,8 @@ class ObjectState:
             lane" -- a vehicle 3 m to the left at 15 m is not a collision risk.
         ttc: Time-to-collision estimate.
         in_path: Whether the object lies within the ego corridor.
+        light_state: For a traffic light, what it is showing. None otherwise --
+            colour needs pixels, which the tracker does not keep.
         distance_source: ``homography``, ``depth`` or ``none`` -- which estimator
             produced ``distance_m``. Recorded because the two carry very
             different error characteristics and an alert should be auditable
@@ -49,6 +52,8 @@ class ObjectState:
     ttc: TTCEstimate
     in_path: bool
     distance_source: str = "none"
+    #: Set only for traffic lights, by the perception stage that can see pixels.
+    light_state: Any = None
 
 
 class CollisionEstimator:

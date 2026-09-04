@@ -45,16 +45,28 @@ class TestClassMapping:
         """Three COCO ids map to 'vehicle'; the manifest must list it once."""
         names = YOLOv8Detector.vocabulary()
         assert names.count("vehicle") == 1
-        assert set(names) == {"person", "bicycle", "vehicle", "motorcycle"}
+        assert set(names) == {"person", "bicycle", "vehicle", "motorcycle",
+                              "traffic_light", "traffic_sign"}
 
-    def test_traffic_lights_are_not_silently_mapped(self) -> None:
-        """COCO 9 (traffic light) and 11 (stop sign) are outside the vocabulary.
+    def test_traffic_control_maps_to_its_own_classes(self) -> None:
+        """COCO 9/11 now map to traffic control, added at schema v3.
 
-        They must be absent rather than folded into an existing class -- adding
-        them is a change to CLASS_NAMES and the cache schema, not to this dict.
+        They must never fold into an existing class: a traffic light counted as
+        a vehicle would enter the collision logic and warn about hitting a
+        signal gantry.
         """
-        assert 9 not in YOLOv8Detector.COCO_TO_CLASS
-        assert 11 not in YOLOv8Detector.COCO_TO_CLASS
+        assert YOLOv8Detector.COCO_TO_CLASS[9] == "traffic_light"
+        assert YOLOv8Detector.COCO_TO_CLASS[11] == "traffic_sign"
+        assert "vehicle" not in (YOLOv8Detector.COCO_TO_CLASS[9],
+                                 YOLOv8Detector.COCO_TO_CLASS[11])
+
+    def test_coco_has_only_one_kind_of_sign(self) -> None:
+        """Worth pinning: COCO's only sign is the stop sign, so `traffic_sign`
+        from this detector is narrower than the same class from a BDD100K model.
+        """
+        signs = [k for k, v in YOLOv8Detector.COCO_TO_CLASS.items()
+                 if v == "traffic_sign"]
+        assert signs == [11]
 
 
 class TestPretrainedNamePattern:
@@ -154,7 +166,8 @@ class TestCheckpointClassMapping:
             self.names = names
 
     COCO = {0: "person", 1: "bicycle", 2: "car", 3: "motorcycle", 4: "airplane",
-            5: "bus", 6: "train", 7: "truck", 9: "traffic light"}
+            5: "bus", 6: "train", 7: "truck", 9: "traffic light",
+            10: "fire hydrant", 11: "stop sign"}
     PROJECT = {0: "vehicle", 1: "person", 2: "bicycle", 3: "motorcycle"}
 
     def test_a_coco_checkpoint_uses_the_coco_table(self) -> None:
@@ -162,7 +175,8 @@ class TestCheckpointClassMapping:
         m = YOLOv8Detector._build_index_map(self._FakeModel(self.COCO))
         assert m[2] == "vehicle" and m[5] == "vehicle" and m[7] == "vehicle"
         assert m[0] == "person"
-        assert 9 not in m, "traffic light is outside the vocabulary and must be dropped"
+        assert m[9] == "traffic_light" and m[11] == "traffic_sign"
+        assert 4 not in m, "airplane is outside the vocabulary and must be dropped"
 
     def test_a_project_trained_checkpoint_maps_identically(self) -> None:
         from models.perception.yolov8 import YOLOv8Detector
