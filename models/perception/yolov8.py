@@ -80,6 +80,40 @@ class YOLOv8Detector(Detector):
         7: "vehicle",   # truck
     }
 
+    @classmethod
+    def _build_index_map(cls, model) -> dict[int, str]:
+        """Map this checkpoint's class indices onto the project vocabulary.
+
+        Two cases are recognised. A stock COCO checkpoint is matched by its class
+        names, not by its class count, so a differently-ordered 80-class model
+        cannot slip through. A checkpoint already trained on this project's
+        vocabulary maps identically.
+
+        Raises:
+            ValueError: when the checkpoint's classes are neither, rather than
+                guessing an alignment.
+        """
+        names = getattr(model, "names", None) or {}
+        by_index = {int(k): str(v) for k, v in names.items()}
+        lowered = {i: n.lower() for i, n in by_index.items()}
+
+        # Already speaking our vocabulary?
+        if set(lowered.values()) <= set(CLASS_IDS):
+            return {i: n for i, n in lowered.items()}
+
+        # Stock COCO, verified by name rather than by index.
+        coco_expected = {0: "person", 1: "bicycle", 2: "car",
+                         3: "motorcycle", 5: "bus", 7: "truck"}
+        if all(lowered.get(i) == n for i, n in coco_expected.items()):
+            return dict(cls.COCO_TO_CLASS)
+
+        raise ValueError(
+            f"cannot map this checkpoint's classes onto the project vocabulary. "
+            f"Expected either COCO, or a subset of {sorted(CLASS_IDS)}; got "
+            f"{sorted(by_index.values())[:10]}. Retrain with the documented class "
+            f"order, or extend core/types.py:CLASS_NAMES."
+        )
+
     def __init__(self, cfg: DetectorConfig) -> None:
         from ultralytics import YOLO
 
@@ -93,6 +127,11 @@ class YOLOv8Detector(Detector):
         self.model.to(self.device)
         self._weights_path = weights
         self._weights_hash = file_sha256(weights)
+        # Built from the checkpoint's OWN class names, never assumed. A model
+        # fine-tuned on this project's vocabulary emits index 0 for `vehicle`,
+        # which under the COCO table would be read as `person` -- silently
+        # wrong, and invisible until a pedestrian alert fires at a parked car.
+        self._index_map = self._build_index_map(self.model)
 
         log_kv(
             _log, logging.INFO, "detect.loaded",
@@ -201,12 +240,12 @@ class YOLOv8Detector(Detector):
                 results.append(FrameResult.empty((w, h)))
                 continue
 
-            coco = boxes.cls.cpu().numpy().astype(int)
-            keep = np.isin(coco, list(self.COCO_TO_CLASS))
+            raw = boxes.cls.cpu().numpy().astype(int)
+            keep = np.isin(raw, list(self._index_map))
             xyxy = boxes.xyxy.cpu().numpy()[keep].astype(np.float32)
             scores = boxes.conf.cpu().numpy()[keep].astype(np.float32)
             ids = np.array(
-                [CLASS_IDS[self.COCO_TO_CLASS[int(c)]] for c in coco[keep]], dtype=np.int32
+                [CLASS_IDS[self._index_map[int(c)]] for c in raw[keep]], dtype=np.int32
             )
 
             # Degenerate boxes would trip FrameResult's own validation; drop them

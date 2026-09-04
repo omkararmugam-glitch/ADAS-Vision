@@ -30,6 +30,23 @@ PROJECT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT))
 
 
+def _per_class(meta: dict, metrics) -> dict[str, float]:
+    """Per-class mAP@0.5, keyed by class name.
+
+    Reported because a single averaged mAP hides exactly what matters here: a
+    class with a handful of training examples drags nothing down visibly while
+    being useless in practice.
+    """
+    import numpy as np
+
+    ap = getattr(getattr(metrics, "box", None), "ap50", None)
+    if ap is None:
+        return {}
+    values = np.atleast_1d(np.asarray(ap, dtype=float))
+    names = list(meta.get("names", {}).values())
+    return {n: float(v) for n, v in zip(names, values)}
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--data", type=Path, required=True, help="dataset.yaml")
@@ -114,10 +131,9 @@ def main(argv: list[str] | None = None) -> int:
             "precision": float(metrics.box.mp),
             "recall": float(metrics.box.mr),
         },
-        "per_class_mAP50": {
-            c: float(v) for c, v in
-            zip(meta.get("names", {}).values(), getattr(metrics.box, "ap50", []) or [])
-        },
+        # `array or []` raises on a numpy array -- truth value is ambiguous.
+        # Convert explicitly, and tolerate the attribute being absent.
+        "per_class_mAP50": _per_class(meta, metrics),
         "run_dir": str(run_dir),
         "finished": datetime.now().isoformat(timespec="seconds"),
     }

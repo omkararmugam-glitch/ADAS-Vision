@@ -139,3 +139,56 @@ class TestAgainstRealWeights:
         names = {CLASS_NAMES[i] for i in r.class_ids}
         assert "person" in names
         assert "vehicle" in names, "the bus must map to 'vehicle'"
+
+
+class TestCheckpointClassMapping:
+    """The mapping must come from the checkpoint, never be assumed.
+
+    A model fine-tuned on this project's vocabulary emits index 0 for `vehicle`.
+    Read through the COCO table that is `person` -- silently wrong, and invisible
+    until a pedestrian alert fires at a parked car.
+    """
+
+    class _FakeModel:
+        def __init__(self, names):
+            self.names = names
+
+    COCO = {0: "person", 1: "bicycle", 2: "car", 3: "motorcycle", 4: "airplane",
+            5: "bus", 6: "train", 7: "truck", 9: "traffic light"}
+    PROJECT = {0: "vehicle", 1: "person", 2: "bicycle", 3: "motorcycle"}
+
+    def test_a_coco_checkpoint_uses_the_coco_table(self) -> None:
+        from models.perception.yolov8 import YOLOv8Detector
+        m = YOLOv8Detector._build_index_map(self._FakeModel(self.COCO))
+        assert m[2] == "vehicle" and m[5] == "vehicle" and m[7] == "vehicle"
+        assert m[0] == "person"
+        assert 9 not in m, "traffic light is outside the vocabulary and must be dropped"
+
+    def test_a_project_trained_checkpoint_maps_identically(self) -> None:
+        from models.perception.yolov8 import YOLOv8Detector
+        m = YOLOv8Detector._build_index_map(self._FakeModel(self.PROJECT))
+        assert m == {0: "vehicle", 1: "person", 2: "bicycle", 3: "motorcycle"}
+
+    def test_index_zero_is_not_confused_between_the_two(self) -> None:
+        """The exact bug this guards: class 0 means different things."""
+        from models.perception.yolov8 import YOLOv8Detector
+        coco = YOLOv8Detector._build_index_map(self._FakeModel(self.COCO))
+        proj = YOLOv8Detector._build_index_map(self._FakeModel(self.PROJECT))
+        assert coco[0] == "person"
+        assert proj[0] == "vehicle"
+
+    def test_an_unrecognised_vocabulary_raises_rather_than_guessing(self) -> None:
+        from models.perception.yolov8 import YOLOv8Detector
+        import pytest as _pytest
+        weird = {0: "aeroplane", 1: "kangaroo", 2: "sausage"}
+        with _pytest.raises(ValueError, match="cannot map"):
+            YOLOv8Detector._build_index_map(self._FakeModel(weird))
+
+    def test_a_reordered_eighty_class_model_is_not_assumed_to_be_coco(self) -> None:
+        """Matched by name, not by class count."""
+        from models.perception.yolov8 import YOLOv8Detector
+        import pytest as _pytest
+        shuffled = dict(self.COCO)
+        shuffled[0], shuffled[2] = shuffled[2], shuffled[0]   # car <-> person
+        with _pytest.raises(ValueError, match="cannot map"):
+            YOLOv8Detector._build_index_map(self._FakeModel(shuffled))

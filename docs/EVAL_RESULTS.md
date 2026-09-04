@@ -46,9 +46,37 @@ training pipeline end to end, but it is not an evaluation.
 
 | Metric (vs. pseudo-labels) | Value |
 |---|---|
-| mAP@0.5 | *pending* |
-| mAP@0.5:0.95 | *pending* |
-| Precision / Recall | *pending* |
+| mAP@0.5 | **0.6097** |
+| mAP@0.5:0.95 | **0.4095** |
+| Precision | 0.6306 |
+| Recall | 0.5852 |
+
+Per class, which is where the story actually is:
+
+| Class | Train boxes | Val instances | mAP@0.5 |
+|---|---|---|---|
+| vehicle | 12,958 | 2,535 | **0.910** |
+| person | 1,210 | 251 | 0.663 |
+| bicycle | 69 | 16 | 0.591 |
+| motorcycle | 42 | 8 | **0.275** |
+
+The prediction made before training — that 42 motorcycle examples would teach the
+model nothing — is confirmed: motorcycle recall is 0.125, i.e. it finds one in
+eight. The headline 0.61 conceals that completely, which is precisely why the
+per-class table is here.
+
+Agreement with the teacher on held-out frames, as a distillation check:
+
+| Model | Objects found | Agreement with teacher |
+|---|---|---|
+| yolov8n, stock COCO | 36 | 59.9% |
+| yolov8n, distilled | 38 | **65.8%** |
+| yolov8m, teacher | 53 | 100% (reference) |
+
+Distillation moved the student ~6 points closer to the teacher. It also
+**amplified the teacher's ego-hood false positive** rather than fixing it — the
+student's hood box is larger and more confident than the stock model's. That is
+the "inherits the teacher's mistakes" caveat, observed rather than predicted.
 
 The class imbalance is worth noting on its own: 91% of the boxes are `vehicle`,
 and `motorcycle` has 42 examples. Nothing trained on this distribution will learn
