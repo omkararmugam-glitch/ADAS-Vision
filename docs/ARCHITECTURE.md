@@ -171,6 +171,58 @@ code treats as real is the failure mode this design exists to prevent.
 
 ---
 
+## Annotated outputs — where every stage writes pictures
+
+A falling loss and a rising mAP are both consistent with a model that has learned
+to put boxes in confidently wrong places. No scalar distinguishes that from real
+progress; a frame does. So **every stage that produces predictions also writes
+what those predictions look like**, and the locations are fixed:
+
+| Stage | Written to | Contents | Controlled by |
+|---|---|---|---|
+| Training | `outputs/train_previews/<run>/epoch_<N>/` | A **fixed** validation sample, annotated, plus `epoch_<N>_sheet.jpg` | `--preview-every N`, `--preview-images` |
+| Evaluation | `outputs/eval_previews/<run>/` | Validation split (evenly sampled if large) + `contact_sheet.jpg` | automatic after training |
+| Demo pipeline | `outputs/demo/<source>_annotated.mp4` | Every module composited on one frame | `run.py render` |
+| Dataset spot-check | `outputs/tested*/` + `index.html` | Per-frame annotations, filterable gallery | `demo/test_dataset.py` |
+| Model comparison | `outputs/compare*/` | Same frame through several checkpoints | `eval/compare_detectors.py` |
+
+`eval/preview.py` holds those paths as module constants, so this table and the
+code cannot drift apart.
+
+**The training sample is fixed, not resampled.** The entire value is flicking
+between `epoch_005/` and `epoch_030/` for the *same* image and seeing what
+changed; resampling each time would make the comparison meaningless. It is
+evenly spaced over the sorted listing rather than random, so it is reproducible
+without carrying a seed around.
+
+**Previews never abort a run.** The callback is wrapped: a checkpoint matters
+more than a picture, so a preview failure prints and continues.
+
+### What is drawn, and by whom
+
+| Element | Drawn by |
+|---|---|
+| Boxes, class, confidence | Ultralytics `results.plot()` for plain detection previews; `core/overlay.draw_boxes` in the pipeline |
+| Track id (`#7`) | `core/overlay.draw_boxes`, ahead of the class name |
+| Distance in metres | `core/overlay.draw_boxes`, when calibration is available |
+| Lane fits and masks | `core/overlay.draw_lane_fits`, `draw_mask` |
+| Weather / road condition | `core/overlay.draw_status_corner`, top-right |
+| Fusion alerts | `core/overlay.draw_hud` warning rows, top-left |
+
+Ultralytics' own renderer is used for detection-only previews per the brief: it
+is maintained, it matches what anyone familiar with YOLO expects, and a second
+copy of box-drawing code would drift. Custom drawing is used only where
+`plot()` cannot help — lane geometry, track ids, the classification corner and
+fusion alerts, none of which Ultralytics knows about.
+
+**The status corner suppresses `unknown`.** A corner permanently reading
+"weather: unknown" trains the eye to skip the whole region, including the frames
+where it says something real.
+
+**Track ids and distances are matched to detections by box overlap, not index.**
+Tracking reorders objects and drops unconfirmed ones, so positional
+correspondence with the frame's detections does not survive it.
+
 ## Post-processing is not inference
 
 `tracker`, `ttc` and `fusion` are deliberately **excluded from the cache key**.

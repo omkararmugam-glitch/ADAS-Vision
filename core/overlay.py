@@ -105,14 +105,19 @@ def draw_boxes(
     result: FrameResult,
     cfg: OverlayConfig,
     distances_m: dict[int, float] | None = None,
+    track_ids: dict[int, int] | None = None,
 ) -> np.ndarray:
-    """Draw detection boxes with class, confidence and optional distance.
+    """Draw detection boxes with class, confidence, distance and track id.
 
     Args:
         image: BGR frame; not modified.
         result: Detections in image pixels at this frame's size.
         cfg: Appearance settings.
         distances_m: Optional map from detection index to forward distance.
+        track_ids: Optional map from detection index to persistent track id.
+            Drawn as ``#id`` ahead of the class name, because when watching a
+            clip the question is almost always "is this the same object as last
+            frame", and an id buried after the confidence is unreadable at speed.
     """
     vis = image.copy()
     for i in range(len(result)):
@@ -121,7 +126,10 @@ def draw_boxes(
         colour = label_color(name)
         cv2.rectangle(vis, (x1, y1), (x2, y2), colour, cfg.box_thickness)
 
-        parts = [name, f"{result.scores[i]:.2f}"]
+        parts = []
+        if track_ids is not None and i in track_ids:
+            parts.append(f"#{track_ids[i]}")
+        parts += [name, f"{result.scores[i]:.2f}"]
         if distances_m is not None and i in distances_m:
             parts.append(f"{distances_m[i]:.1f}m")
         text = " ".join(parts)
@@ -219,6 +227,62 @@ def draw_hud(
     return vis
 
 
+def draw_status_corner(
+    image: np.ndarray,
+    cfg: OverlayConfig,
+    weather: str | None = None,
+    road_condition: str | None = None,
+    extra: list[tuple[str, str]] | None = None,
+) -> np.ndarray:
+    """Draw per-frame classifications in the top-right corner.
+
+    Kept away from the top-left HUD deliberately. The HUD carries continuously
+    changing geometry that a reader scans; these are slow-changing scene labels
+    that a reader only glances at, and mixing the two makes both harder to read.
+
+    An absent classifier renders nothing rather than "unknown" -- a corner full
+    of "unknown" trains the eye to skip the whole region, including the times it
+    says something.
+    """
+    # "unknown" is what an absent or unconfident classifier reports, and it is
+    # not worth a row: a corner permanently reading "unknown" trains the eye to
+    # skip the whole region, including the frames where it says something real.
+    def _known(v: str | None) -> bool:
+        return bool(v) and str(v).lower() not in {"unknown", "none", "undefined"}
+
+    rows: list[tuple[str, str]] = []
+    if _known(weather):
+        rows.append(("weather", str(weather)))
+    if _known(road_condition):
+        rows.append(("road", str(road_condition)))
+    rows.extend(extra or [])
+    if not rows:
+        return image
+
+    vis = image.copy()
+    pad, line_h = 8, int(26 * max(0.6, cfg.font_scale / 0.5))
+    scale = cfg.font_scale * 1.05
+    width = max(
+        cv2.getTextSize(f"{k}: {v}", FONT, scale, 1)[0][0] for k, v in rows
+    ) + 2 * pad
+    height = line_h * len(rows) + pad
+    x0 = vis.shape[1] - width - 10
+    y0 = 10
+
+    panel = vis[y0:y0 + height, x0:x0 + width]
+    if panel.size:
+        dark = np.zeros_like(panel)
+        cv2.addWeighted(dark, 0.55, panel, 0.45, 0, panel)
+    for i, (k, v) in enumerate(rows):
+        y = y0 + pad + line_h * i + int(line_h * 0.6)
+        cv2.putText(vis, f"{k}: ", (x0 + pad, y), FONT, scale,
+                    (170, 170, 170), 1, cv2.LINE_AA)
+        kw = cv2.getTextSize(f"{k}: ", FONT, scale, 1)[0][0]
+        cv2.putText(vis, v, (x0 + pad + kw, y), FONT, scale,
+                    label_color(v), 1, cv2.LINE_AA)
+    return vis
+
+
 def lane_hud_lines(lanes: LaneSet) -> list[str]:
     """HUD rows describing lane geometry, honest about degraded states."""
     if lanes.status is LaneStatus.OK:
@@ -243,6 +307,10 @@ def annotate(
     cfg: OverlayConfig,
     hud_lines: list[str] | None = None,
     warnings: list[str] | None = None,
+    track_ids: dict[int, int] | None = None,
+    distances_m: dict[int, float] | None = None,
+    weather: str | None = None,
+    road_condition: str | None = None,
 ) -> np.ndarray:
     """Compose the full annotation for one frame, in draw order.
 
@@ -254,7 +322,8 @@ def annotate(
     if cfg.show_lane_mask:
         vis = draw_mask(vis, result.lane_mask, cfg, LANE_MASK_COLOR, alpha=cfg.lane_mask_alpha)
     vis = draw_lane_fits(vis, lanes, camera, cfg)
-    vis = draw_boxes(vis, result, cfg)
+    vis = draw_boxes(vis, result, cfg, distances_m=distances_m, track_ids=track_ids)
+    vis = draw_status_corner(vis, cfg, weather, road_condition)
     return draw_hud(vis, hud_lines or [], cfg, warnings)
 
 

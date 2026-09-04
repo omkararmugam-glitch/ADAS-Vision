@@ -64,6 +64,10 @@ def main(argv: list[str] | None = None) -> int:
     # slightly slower per epoch and reliably starts.
     ap.add_argument("--workers", type=int,
                     default=0 if sys.platform == "win32" else 8)
+    ap.add_argument("--preview-every", type=int, default=5,
+                    help="save annotated validation frames every N epochs; 0 disables")
+    ap.add_argument("--preview-images", type=int, default=8,
+                    help="how many fixed validation frames to annotate each time")
     args = ap.parse_args(argv)
 
     if not args.data.is_file():
@@ -92,7 +96,51 @@ def main(argv: list[str] | None = None) -> int:
 
     from ultralytics import YOLO
 
+    from eval.preview import (
+        TRAIN_PREVIEW_ROOT,
+        contact_sheet,
+        save_training_previews,
+    )
+
+    val_images = args.data.parent / str(meta.get("val", "images/val"))
+
     model = YOLO(args.model)
+
+    # Previews are written from an on_train_epoch_end callback rather than after
+    # training, because the entire point is to watch the model change. A loss
+    # curve that falls while the boxes stay in the wrong place looks identical to
+    # one that falls because the model is learning; only the frames distinguish
+    # them.
+    if args.preview_every > 0 and val_images.is_dir():
+        preview_root = TRAIN_PREVIEW_ROOT / name
+
+        def _on_epoch_end(trainer) -> None:
+            epoch = int(getattr(trainer, "epoch", 0)) + 1
+            if epoch % args.preview_every and epoch != args.epochs:
+                return
+            ckpt = Path(trainer.save_dir) / "weights" / "last.pt"
+            if not ckpt.is_file():
+                return
+            try:
+                written = save_training_previews(
+                    ckpt, val_images, epoch, n=args.preview_images,
+                    root=preview_root, label_source=source,
+                )
+                if written:
+                    contact_sheet(
+                        written, preview_root / f"epoch_{epoch:03d}_sheet.jpg",
+                        title=f"{name} - epoch {epoch}",
+                    )
+                    print(f"  previews -> {written[0].parent}  ({len(written)} frames)")
+            except Exception as exc:                  # noqa: BLE001 - deliberate
+                # A preview failure must never abort a training run that is
+                # otherwise fine; the checkpoint matters more than the picture.
+                print(f"  preview failed at epoch {epoch}: {exc}")
+
+        model.add_callback("on_train_epoch_end", _on_epoch_end)
+    elif args.preview_every > 0:
+        print(f"  ! no validation images at {val_images}; previews disabled")
+
     model.train(
         data=str(args.data.resolve()),
         epochs=args.epochs,
@@ -137,6 +185,21 @@ def main(argv: list[str] | None = None) -> int:
         "run_dir": str(run_dir),
         "finished": datetime.now().isoformat(timespec="seconds"),
     }
+    # Full evaluation previews once training is done.
+    from eval.preview import EVAL_PREVIEW_ROOT, save_eval_previews
+
+    eval_dir = EVAL_PREVIEW_ROOT / name
+    best = run_dir / "weights" / "best.pt"
+    if best.is_file() and val_images.is_dir():
+        shots = save_eval_previews(best, val_images, eval_dir,
+                                   max_images=args.preview_images * 6,
+                                   label_source=source)
+        if shots:
+            contact_sheet(shots[:12], eval_dir / "contact_sheet.jpg",
+                          title=f"{name} - validation predictions")
+            summary["eval_previews"] = str(eval_dir)
+            print(f"eval previews -> {eval_dir}  ({len(shots)} frames)")
+
     out = run_dir / "summary.json"
     out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
@@ -148,6 +211,7 @@ def main(argv: list[str] | None = None) -> int:
     if pseudo:
         print("(agreement with the teacher -- NOT correctness)")
     print(f"artifacts    {run_dir}")
+    print(f"previews     {TRAIN_PREVIEW_ROOT / name}  (per-epoch)")
     print(f"summary      {out}")
     print("=" * 68)
     return 0

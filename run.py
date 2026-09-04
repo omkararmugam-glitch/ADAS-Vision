@@ -20,6 +20,9 @@ from pathlib import Path
 
 import numpy as np
 
+#: Repo root, for placing deliverables outside the cache.
+PROJECT_ROOT = Path(__file__).resolve().parent
+
 from core.cache import RunCache
 from core.calibrate import CameraModel, file_sha256_of_text
 from core.config import Config, load_config
@@ -363,7 +366,15 @@ def cmd_render(args: argparse.Namespace) -> int:
         )
 
     records = {r.frame_index: r for r in cache.read(with_masks=False)}
-    out_path = Path(args.out) if args.out else cache.run_dir / "annotated.mp4"
+    # Default into outputs/demo/ rather than beside the cache: the annotated
+    # video is a deliverable someone looks at, not a cache artifact, and burying
+    # it in a hashed run directory is why it kept getting overlooked.
+    if args.out:
+        out_path = Path(args.out)
+    else:
+        demo_dir = PROJECT_ROOT / "outputs/demo"
+        demo_dir.mkdir(parents=True, exist_ok=True)
+        out_path = demo_dir / f"{Path(str(args.source)).stem}_annotated.mp4"
     render_camera: CameraModel | None = None
     frame_size = tuple(cache.existing_manifest().extra.get("frame_size", (0, 0)))
 
@@ -409,17 +420,48 @@ def cmd_render(args: argparse.Namespace) -> int:
                     drivable_mask=drivable,
                     lane_mask=lane,
                 )
+                objs = objects_by_frame.get(frame.index, [])
                 hud, warnings = _hud(cfg, record, result,
-                                     decisions.get(frame.index),
-                                     objects_by_frame.get(frame.index, []))
-                writer.write(
-                    annotate(frame.image, result, record.lanes, render_camera, cfg.overlay, hud, warnings)
-                )
+                                     decisions.get(frame.index), objs)
+                track_ids, distances = _overlay_maps(result, objs)
+                writer.write(annotate(
+                    frame.image, result, record.lanes, render_camera, cfg.overlay,
+                    hud, warnings,
+                    track_ids=track_ids, distances_m=distances,
+                    weather=record.extras.get("weather") or None,
+                    road_condition=record.extras.get("road_condition") or None,
+                ))
                 timer.tick()
             rendered = timer.items
 
     _print_summary(cache, rendered=rendered, out_path=out_path)
     return 0
+
+
+def _overlay_maps(result: FrameResult, objects: list) -> tuple[dict, dict]:
+    """Map detection index -> track id and distance, for the box labels.
+
+    Matched by box overlap rather than by index: tracking reorders objects and
+    drops unconfirmed ones, so a positional correspondence with the frame's
+    detections does not survive it.
+    """
+    from tracking.bytetrack import iou_matrix
+
+    if not objects or len(result) == 0:
+        return {}, {}
+    det = np.asarray(result.boxes_px, dtype=np.float64).reshape(-1, 4)
+    obj = np.asarray([o.box_px for o in objects], dtype=np.float64).reshape(-1, 4)
+    ious = iou_matrix(det, obj)
+    track_ids: dict[int, int] = {}
+    distances: dict[int, float] = {}
+    for i in range(len(det)):
+        j = int(np.argmax(ious[i]))
+        if ious[i, j] < 0.5:
+            continue
+        track_ids[i] = objects[j].track_id
+        if objects[j].distance_m is not None:
+            distances[i] = float(objects[j].distance_m)
+    return track_ids, distances
 
 
 def _hud(
