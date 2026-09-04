@@ -12,16 +12,17 @@
 | 2 | VRU detector (pedestrian/cyclist) | **done** |
 | 2 | Lane fitting in bird's-eye metres | **done** |
 | 2 | Overlay + annotated video | **done** |
-| 3 | Dataset adapters | spec written, blocked on a dataset sample |
+| 3 | Dataset adapters | **BDD100K adapter done**, blocked on the label file |
 | 3 | YOLOv8 baseline | **working** on COCO-pretrained weights; not fine-tuned |
-| 3 | Weather classifier | placeholder |
-| 3 | Pothole detector | placeholder |
+| 3 | Weather classifier | blocked: needs BDD100K `attributes.weather` |
+| 3 | Pothole detector | blocked: no pothole dataset supplied |
 | 4 | ByteTrack tracking | **done** |
-| 4 | MiDaS depth | placeholder |
+| 4 | MiDaS depth | **done** |
 | 4 | Lane-change detection, TTC | **done** |
 | 5 | Fusion / decision engine | **done** |
-| 7 | Evaluation scripts | placeholder |
-| 8 | ONNX export, FPS benchmark, dashboard | not started |
+| 7 | Evaluation scripts | **partial** — alert scoring done; mAP/mIoU need labels |
+| 8 | ONNX export + FPS benchmark | **done** |
+| 8 | Demo: HTML report + result gallery | **done** |
 
 > **Calibration must be regenerated.** `calib/*.yaml` was excluded by
 > `.gitignore` and was lost when the working tree was cleared. Distance, TTC and
@@ -233,6 +234,51 @@ from reading as a lane change.
 
 Hysteresis (`recover_threshold` below `departure_threshold`) stops a vehicle
 riding near the limit from re-triggering every few frames.
+
+## Monocular depth — shape from MiDaS, scale from the homography
+
+MiDaS predicts **relative inverse depth**. The map is correct up to an unknown
+scale and shift, so a raw MiDaS value is not a distance and is not even
+comparable between two frames. That is the fact most integrations gloss over.
+
+The standard relation is affine in inverse depth:
+
+```
+1/Z  ≈  a·d + b
+```
+
+Fitting `(a, b)` needs points whose true `Z` is known — and this pipeline already
+has them. Every tracked object whose ground-contact point the homography accepted
+is a pixel with a known metric distance. **The anchors come from the scene
+itself**: no extra sensor, and no assumption beyond the one the homography
+already makes.
+
+That division of labour is the whole design:
+
+| | Coverage | Scale |
+|---|---|---|
+| Homography | objects on flat road only | metric, accurate |
+| MiDaS | every pixel | none |
+| Fitted together | every pixel | metric, inherited |
+
+So **MiDaS is never the source of scale, only of shape.** Where the homography
+can place an object it wins outright. Depth earns its cost only on what the
+homography cannot see at all: an occluded ground-contact point, a vehicle on a
+crest or in a dip, the back of a truck whose wheels are hidden. It is therefore
+`enabled: false` by default — it is a fallback, not an upgrade.
+
+**The fit is rejected more often than it is used, deliberately.** A bad scale
+produces confident, wrong metres, which is the worst failure available to a
+collision warning. Rejection triggers on: fewer than `min_anchors` points, a
+slope the anchors do not constrain, an inverted depth ordering (the network and
+the ground plane describing different scenes), and — the one that matters most —
+a median metric error above `max_residual_m`. That last guard exists because
+`r²` can look healthy while the metres are badly wrong: the fit lives in inverse
+space, where distant points contribute almost nothing to the residual. An invalid
+scale returns `inf`, never a guess.
+
+`ObjectState.distance_source` records `homography`, `depth` or `none`, so any
+alert stays auditable back to which estimator produced its distance.
 
 ## Tracking — ByteTrack over DeepSORT
 
