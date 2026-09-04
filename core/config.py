@@ -685,6 +685,66 @@ class FusionConfig(_Strict):
             )
 
 
+class DepthConfig(_Strict):
+    """Monocular depth estimation.
+
+    Part of the cache key: unlike tracking and fusion, this runs a network per
+    frame, so its output is expensive and belongs in the cache.
+
+    Attributes:
+        enabled: Whether depth runs at all. Off by default -- the calibrated
+            homography is the better estimate for objects on flat road, and
+            depth earns its cost only on the cases the homography cannot see.
+        kind: ``midas`` for the real model, ``stub`` for the planar stand-in
+            that needs no weights and no network.
+        model: torch.hub entry point. The small variant is the deliberate
+            choice on an 8 GB GPU already hosting the detector and tracker.
+        device: ``auto``, ``cuda`` or ``cpu``.
+        half: fp16 on CUDA.
+        min_anchors: Ground-plane points needed before a metric scale is fitted.
+        max_residual_m: Median anchor error above which the fit is rejected.
+            The guard that matters -- a numerically healthy fit can still be
+            metrically wrong, and a wrong scale yields confident false distances.
+        min_r_squared: Minimum correlation, in inverse-depth space, for a fit.
+        patch_px: Side of the median window sampled around each anchor point.
+            Depth maps are noisiest at object boundaries, which is exactly where
+            a box's bottom edge sits.
+    """
+
+    enabled: bool = False
+    kind: str = "midas"
+    model: str = "MiDaS_small"
+    device: str = "auto"
+    half: bool = True
+    min_anchors: int = 4
+    max_residual_m: float = 6.0
+    min_r_squared: float = 0.5
+    patch_px: int = 5
+
+    @field_validator("kind")
+    @classmethod
+    def _known_kind(cls, v: str) -> str:
+        if v not in {"midas", "stub"}:
+            raise ValueError(f"depth.kind must be 'midas' or 'stub', got '{v}'")
+        return v
+
+    @field_validator("min_anchors")
+    @classmethod
+    def _enough_anchors(cls, v: int) -> int:
+        if v < 2:
+            raise ValueError(
+                f"min_anchors must be >= 2 (two points define the affine fit), got {v}"
+            )
+        return v
+
+    @field_validator("patch_px")
+    @classmethod
+    def _odd_patch(cls, v: int) -> int:
+        if v < 1 or v % 2 == 0:
+            raise ValueError(f"patch_px must be a positive odd number, got {v}")
+        return v
+
+
 class Config(_Strict):
     """Root config. Sections are added as pipeline stages land."""
 
@@ -694,6 +754,7 @@ class Config(_Strict):
     cache: CacheConfig = Field(default_factory=CacheConfig)
     detector: DetectorConfig = Field(default_factory=DetectorConfig)
     lanes: LaneFitConfig = Field(default_factory=LaneFitConfig)
+    depth: DepthConfig = Field(default_factory=DepthConfig)
     tracker: TrackerConfig = Field(default_factory=TrackerConfig)
     ttc: TTCConfig = Field(default_factory=TTCConfig)
     fusion: FusionConfig = Field(default_factory=FusionConfig)
@@ -706,7 +767,9 @@ class Config(_Strict):
     #: post-processing ones -- `tracker`, and later TTC and fusion -- because
     #: they run over cached detections in seconds; retuning an alert threshold
     #: must never re-run a network.
-    CACHE_KEY_SECTIONS: ClassVar[tuple[str, ...]] = ("io", "calibration", "bev", "detector", "lanes")
+    CACHE_KEY_SECTIONS: ClassVar[tuple[str, ...]] = (
+        "io", "calibration", "bev", "detector", "lanes", "depth",
+    )
 
     def cache_key_payload(self) -> dict[str, Any]:
         """The config subset that cached results depend on."""

@@ -12,8 +12,9 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from core.calibrate import CameraModel
-from core.config import TTCConfig
+from core.config import DepthConfig, TTCConfig
 from core.types import CLASS_NAMES
+from depth.align import DepthScale, fit_scale, sample_depth
 from tracking.track import Track
 from tracking.ttc import TTCEstimate, combine, range_rate_ttc, scale_expansion_ttc
 
@@ -33,6 +34,10 @@ class ObjectState:
             lane" -- a vehicle 3 m to the left at 15 m is not a collision risk.
         ttc: Time-to-collision estimate.
         in_path: Whether the object lies within the ego corridor.
+        distance_source: ``homography``, ``depth`` or ``none`` -- which estimator
+            produced ``distance_m``. Recorded because the two carry very
+            different error characteristics and an alert should be auditable
+            back to which one was used.
     """
 
     track_id: int
@@ -43,6 +48,7 @@ class ObjectState:
     lateral_offset_m: float | None
     ttc: TTCEstimate
     in_path: bool
+    distance_source: str = "none"
 
 
 class CollisionEstimator:
@@ -53,10 +59,18 @@ class CollisionEstimator:
     grow this without bound.
     """
 
-    def __init__(self, cfg: TTCConfig, camera: CameraModel | None = None) -> None:
+    def __init__(
+        self,
+        cfg: TTCConfig,
+        camera: CameraModel | None = None,
+        depth_cfg: DepthConfig | None = None,
+    ) -> None:
         self.cfg = cfg
         self.camera = camera
+        self.depth_cfg = depth_cfg
         self._distances: dict[int, list[tuple[float, float]]] = {}
+        #: Scale fitted on the most recent frame, exposed for logging and tests.
+        self.depth_scale: DepthScale | None = None
 
     def _ground_position(self, track: Track) -> tuple[float | None, float | None]:
         """Back-project the box's ground-contact point to ego metres.
@@ -77,16 +91,82 @@ class CollisionEstimator:
             return None, None
         return forward, lateral
 
-    def update(self, tracks: list[Track], timestamp_s: float) -> list[ObjectState]:
-        """Compute collision state for every active track this frame."""
+    def _fit_depth_scale(
+        self, tracks: list[Track], ground: dict[int, tuple[float, float]],
+        depth_map: np.ndarray,
+    ) -> DepthScale:
+        """Fit metres onto the relative depth map, using on-road tracks as anchors.
+
+        The anchors come from the scene itself: every tracked object whose
+        ground-contact point the homography accepted is a point where the true
+        distance is known. No extra sensor, no assumption beyond the one the
+        homography already makes.
+        """
+        cfg = self.depth_cfg
+        pts, dists = [], []
+        for t in tracks:
+            g = ground.get(t.track_id)
+            if g is None:
+                continue
+            pts.append(t.bottom_centre_px)
+            dists.append(g[0])
+        if len(pts) < cfg.min_anchors:
+            return DepthScale(n_anchors=len(pts))
+        values = sample_depth(depth_map, np.asarray(pts), patch=cfg.patch_px)
+        return fit_scale(
+            values, np.asarray(dists),
+            min_anchors=cfg.min_anchors,
+            max_residual_m=cfg.max_residual_m,
+            min_r_squared=cfg.min_r_squared,
+        )
+
+    def update(
+        self,
+        tracks: list[Track],
+        timestamp_s: float,
+        depth_map: np.ndarray | None = None,
+    ) -> list[ObjectState]:
+        """Compute collision state for every active track this frame.
+
+        Args:
+            tracks: Confirmed tracks for this frame.
+            timestamp_s: Frame time, for the TTC time base.
+            depth_map: Optional relative depth. Used only to supply a distance
+                for objects the homography could not place -- an occluded
+                ground-contact point, or anything off the road plane.
+        """
         alive = {t.track_id for t in tracks}
         for tid in list(self._distances):
             if tid not in alive:
                 del self._distances[tid]
 
+        ground = {}
+        for t in tracks:
+            fwd, lat = self._ground_position(t)
+            if fwd is not None:
+                ground[t.track_id] = (fwd, lat)
+
+        self.depth_scale = None
+        if depth_map is not None and self.depth_cfg is not None:
+            self.depth_scale = self._fit_depth_scale(tracks, ground, depth_map)
+
         out: list[ObjectState] = []
         for t in tracks:
-            forward, lateral = self._ground_position(t)
+            forward, lateral = ground.get(t.track_id, (None, None))
+            source = "homography" if forward is not None else "none"
+            if (
+                forward is None
+                and depth_map is not None
+                and self.depth_scale is not None
+                and self.depth_scale.valid
+            ):
+                value = sample_depth(
+                    depth_map, t.bottom_centre_px.reshape(1, 2),
+                    patch=self.depth_cfg.patch_px,
+                )
+                z = float(self.depth_scale.to_metres(value)[0])
+                if np.isfinite(z) and z > 0:
+                    forward, source = z, "depth"
             if forward is not None:
                 hist = self._distances.setdefault(t.track_id, [])
                 hist.append((timestamp_s, forward))
@@ -116,6 +196,7 @@ class CollisionEstimator:
                 lateral_offset_m=lateral,
                 ttc=estimate,
                 in_path=self.in_path(lateral, forward),
+                distance_source=source,
             ))
         return out
 
@@ -138,3 +219,4 @@ class CollisionEstimator:
 
     def reset(self) -> None:
         self._distances.clear()
+        self.depth_scale = None

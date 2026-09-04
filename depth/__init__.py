@@ -1,20 +1,32 @@
-"""Monocular depth -- MiDaS/DPT wrapper. PLACEHOLDER, build step 4.
+"""Monocular depth, used only where the calibrated ground plane cannot help.
 
-ACCURACY WARNING, stated here because it governs how these outputs may be used:
-MiDaS predicts *relative inverse* depth, not metres. It is defined only up to an
-unknown scale and shift, so its raw output cannot yield a distance in metres
-without being fitted to some metric reference.
+The homography gives accurate metric distance for objects standing on flat road,
+and says nothing at all about anything else -- an occluded contact point, a
+vehicle on a crest, a truck whose wheels are hidden. MiDaS covers every pixel but
+carries no scale.
 
-This project already has a better metric reference for the common case: the
-calibrated ground-plane homography in :mod:`core.calibrate` gives true metres for
-any object whose contact point with the road is visible. The intended division of
-labour is therefore:
-
-  * **homography** -- primary, for objects touching the road (vehicles ahead,
-    pedestrians). Accurate where the flat-ground assumption holds.
-  * **MiDaS** -- fallback, for objects whose ground contact is occluded or
-    off-plane, and as a consistency check that flags disagreement rather than
-    silently trusting either source.
-
-See ``docs/ARCHITECTURE.md`` for the full error analysis.
+:mod:`depth.align` combines them: the homography supplies metric anchors, an
+affine fit transfers that scale to the relative depth map, and the result extends
+metric distance to the pixels the homography could not reach. MiDaS is therefore
+never the source of scale, only of shape -- and where both are available, the
+homography wins.
 """
+
+from depth.align import MIN_ANCHORS, DepthScale, fit_scale, sample_depth
+from depth.midas import (
+    DepthEstimator,
+    MiDaSDepth,
+    PlanarStubDepth,
+    build_depth_estimator,
+)
+
+__all__ = [
+    "DepthEstimator",
+    "MiDaSDepth",
+    "PlanarStubDepth",
+    "build_depth_estimator",
+    "DepthScale",
+    "fit_scale",
+    "sample_depth",
+    "MIN_ANCHORS",
+]

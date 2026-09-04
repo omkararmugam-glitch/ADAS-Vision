@@ -110,6 +110,27 @@ lanes:
   eval_distance_m: 10.0
   adjacent_lanes: true
 
+# Monocular depth. IN the cache key -- unlike tracking and fusion, this runs a
+# network per frame, so its output is expensive and belongs cached.
+#
+# Off by default and that is deliberate: for an object standing on flat road the
+# calibrated homography is the BETTER estimate, and depth earns its cost only on
+# the cases the homography cannot see at all -- an occluded ground-contact point,
+# a vehicle on a crest, a truck whose wheels are hidden.
+depth:
+  enabled: false
+  kind: midas             # 'stub' is a planar stand-in needing no weights
+  model: MiDaS_small      # small on purpose: 8 GB already hosts detector+tracker
+  device: auto
+  half: true
+  # MiDaS output is relative, so metres come from fitting it to ground-plane
+  # anchors taken from tracked objects the homography DID place. These guards
+  # reject a fit that would produce confident, wrong distances.
+  min_anchors: 4
+  max_residual_m: 6.0
+  min_r_squared: 0.5
+  patch_px: 5             # median window; depth is noisiest at object edges
+
 # --------------------------------------------------------------------------- #
 # Post-processing. NONE of the sections below contribute to the cache key: they
 # run over cached detections in seconds, so retuning an alert threshold must

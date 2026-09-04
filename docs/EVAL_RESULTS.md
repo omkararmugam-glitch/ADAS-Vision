@@ -24,6 +24,43 @@ the dataset split it was measured on — a number without both is not a result.
 
 ---
 
+## 0. Distillation run — a note on what it does and does not show
+
+The BDD100K images arrived without their label file, so before any ground truth
+exists the only training possible is **distillation**: YOLOv8m labels the frames,
+and YOLOv8n is trained to reproduce those labels.
+
+**Any mAP in this section measures agreement with the teacher, not correctness.**
+The student cannot detect what the teacher misses and faithfully inherits its
+mistakes — including the false positives on the ego vehicle's own hood. It is a
+real training run producing a real checkpoint, and it validates the whole
+training pipeline end to end, but it is not an evaluation.
+
+| | |
+|---|---|
+| Teacher | yolov8m.pt (COCO-pretrained), conf ≥ 0.4 |
+| Student | yolov8n.pt |
+| Images | 2,500 pseudo-labelled — 2,000 train / 500 val |
+| Boxes | 14,279 (vehicle 12,958 · person 1,210 · bicycle 69 · motorcycle 42) |
+| Empty frames | 155 (6.2%) |
+
+| Metric (vs. pseudo-labels) | Value |
+|---|---|
+| mAP@0.5 | *pending* |
+| mAP@0.5:0.95 | *pending* |
+| Precision / Recall | *pending* |
+
+The class imbalance is worth noting on its own: 91% of the boxes are `vehicle`,
+and `motorcycle` has 42 examples. Nothing trained on this distribution will learn
+motorcycles, and a headline mAP averaged over four classes would hide that
+entirely — which is why per-class numbers are reported below rather than a single
+figure.
+
+Replacing the pseudo-labels with `det_train.json` turns every table below from
+"agreement" into "correctness" with no other change to the pipeline.
+
+---
+
 ## 1. Object detection — mAP@0.5
 
 | Model | Dataset / split | vehicle | person | bicycle | motorcycle | mAP@0.5 | mAP@0.5:0.95 |
