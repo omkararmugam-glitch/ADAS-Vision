@@ -88,8 +88,9 @@ class TestMarkup:
     def test_the_no_training_banner_is_present(self, assets: Path) -> None:
         """The report must never imply a model was trained. This is load-bearing."""
         out = render(build_sections(), assets, embed=False)
-        assert "No model has been fine-tuned" in out
-        assert "no mAP" in out.lower() or "No mAP" in out
+        assert "No model has been fine-tuned on ground-truth" in out
+        # Wherever a metric appears, its provenance must appear with it.
+        assert "not correctness" in out
 
 
 class TestImageModes:

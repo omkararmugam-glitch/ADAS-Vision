@@ -52,20 +52,82 @@ class Section:
     table: tuple[list[str], list[list[str]]] | None = None
 
 
+def training_section() -> Section | None:
+    """The distillation run, if it produced artifacts.
+
+    Returns None when nothing has been trained, so the report never carries an
+    empty "results" heading implying a run that did not happen.
+    """
+    summary_path = PROJECT / "outputs/train/distill_v8n/summary.json"
+    if not summary_path.is_file():
+        return None
+    data = json.loads(summary_path.read_text(encoding="utf-8"))
+    m = data.get("metrics", {})
+    pseudo = data.get("label_source") == "pseudo"
+
+    figures = [
+        Figure("training_curves.jpg", "Training curves",
+               "mAP, precision and recall per epoch on the held-out split.",
+               "Measured against pseudo-labels. This is agreement with the "
+               "teacher, not correctness." if pseudo else ""),
+    ]
+    if (PROJECT / "outputs/report/assets/model_comparison.jpg").is_file():
+        figures.append(Figure(
+            "model_comparison.jpg", "Stock student, trained student, teacher",
+            "The same frames through each model, stacked. If the trained student "
+            "sits closer to the teacher than the stock one does, distillation "
+            "worked &mdash; which is the honest claim available without ground truth.",
+        ))
+
+    body = [
+        "A real training run producing a real checkpoint. Because the dataset "
+        "shipped without its label file, the targets are <strong>pseudo-labels</strong> "
+        "from a larger teacher (YOLOv8m), which makes this "
+        "<strong>distillation</strong> rather than fine-tuning.",
+        "The student cannot detect what the teacher misses and inherits its "
+        "mistakes, including the false positives on the ego vehicle&rsquo;s own hood. "
+        "It does produce a nano model specialised to dashcam scenes rather than to "
+        "COCO, and it exercises the whole training pipeline, so swapping in real "
+        "annotations later is a one-argument change.",
+    ]
+    return Section(
+        heading="Distillation run",
+        body=body,
+        figures=figures,
+        table=(
+            ["Metric (vs. pseudo-labels)", "Value"],
+            [
+                ["mAP@0.5", f"{m.get('mAP50', 0):.4f}"],
+                ["mAP@0.5:0.95", f"{m.get('mAP50_95', 0):.4f}"],
+                ["Precision", f"{m.get('precision', 0):.4f}"],
+                ["Recall", f"{m.get('recall', 0):.4f}"],
+                ["Teacher", str(data.get("teacher", "&mdash;"))],
+                ["Epochs", str(data.get("epochs", "&mdash;"))],
+                ["What this measures", "<strong>agreement with the teacher, "
+                 "not correctness</strong>" if pseudo else "correctness"],
+            ],
+        ),
+    )
+
+
 def build_sections() -> list[Section]:
     """The report's content. Edit here, not in the HTML."""
-    return [
+    training = training_section()
+    return ([training] if training else []) + [
         Section(
             heading="Status",
             body=[
-                "The perception and decision pipeline is built and tested end to end. "
-                "<strong>No model has been fine-tuned on the BDD100K dataset</strong>, because "
-                "the 70,000 images were supplied without their label file. Every detection "
-                "shown below is inference using COCO-pretrained YOLOv8m weights.",
-                "Getting to a trained model needs one download: <code>det_train.json</code> from "
+                "The perception and decision pipeline is built and tested end to end.",
+                "<strong>No model has been fine-tuned on ground-truth labels</strong>, because "
+                "the 70,000 images were supplied without their label file. A model has been "
+                "trained by distillation against a larger model&rsquo;s predictions (see above), "
+                "which is a real checkpoint but not a measurement of correctness. Detections "
+                "shown further down are inference with COCO-pretrained YOLOv8m weights.",
+                "Closing that gap needs one download: <code>det_train.json</code> from "
                 "&ldquo;Detection 2020 Labels&rdquo; at "
                 "<a href=\"https://bdd-data.berkeley.edu/\">bdd-data.berkeley.edu</a>. The "
-                "adapter that consumes it is written and tested.",
+                "adapter that consumes it is written and tested, and the training command is "
+                "unchanged &mdash; only the meaning of the resulting mAP changes.",
             ],
             table=(
                 ["Component", "State"],
@@ -78,10 +140,14 @@ def build_sections() -> list[Section]:
                     ["ByteTrack multi-object tracking", "working"],
                     ["Time-to-collision, lane-change detection", "working"],
                     ["Fusion / alert engine", "working"],
-                    ["BDD100K adapter", "written, waiting on labels"],
-                    ["Detector fine-tuning", "blocked: no labels"],
-                    ["Weather classifier, pothole detector", "blocked: no labels"],
-                    ["MiDaS depth, ONNX export", "not started"],
+                    ["MiDaS depth, scale-aligned to the ground plane", "working"],
+                    ["Weather-adaptive collision thresholds", "working"],
+                    ["ONNX export + FPS benchmark", "working"],
+                    ["Alert scoring vs. labelled events", "working"],
+                    ["BDD100K adapter (convert + curate)", "written, waiting on labels"],
+                    ["Weather classifier", "written, waiting on labels"],
+                    ["Detector fine-tuning on ground truth", "blocked: no labels"],
+                    ["Pothole detector", "blocked: no dataset supplied"],
                 ],
             ),
         ),
@@ -301,11 +367,12 @@ def render(sections: list[Section], assets: Path, embed: bool) -> str:
   <p class="standfirst">Lane detection, object detection, multi-object tracking,
   time-to-collision and a rules-based alert engine, running on recorded dashcam
   video. Generated {date.today().isoformat()}.</p>
-  <div class="banner"><p><strong>No model has been fine-tuned on the BDD100K
-  dataset.</strong> The 70,000 images were supplied without their label file, so
-  every detection here is inference with COCO-pretrained weights. No mAP is
-  quoted anywhere, because scoring requires ground-truth boxes that are not
-  present.</p></div>
+  <div class="banner"><p><strong>No model has been fine-tuned on ground-truth
+  labels.</strong> The 70,000 images were supplied without their label file. Where
+  a trained model appears below it was produced by distillation against a larger
+  model&rsquo;s predictions, so its mAP measures agreement with that teacher and
+  <strong>not correctness</strong>. Detection figures elsewhere are inference with
+  COCO-pretrained weights, scored against nothing.</p></div>
 </header>
 {"".join(parts)}
 <footer>Generated by <code>demo/build_report.py</code>. Open directly in a
@@ -331,9 +398,18 @@ def main(argv: list[str] | None = None) -> int:
         )
     sections = build_sections()
 
-    missing = [f.file for s in sections for f in s.figures if not (assets / f.file).is_file()]
-    if missing:
-        raise SystemExit(f"missing images in {assets}: {', '.join(missing)}")
+    # Drop figures whose image is absent rather than refusing to build: the
+    # report should degrade to what exists, not vanish because one optional
+    # artifact has not been generated yet.
+    dropped = []
+    for sec in sections:
+        keep = []
+        for f in sec.figures:
+            (keep if (assets / f.file).is_file() else dropped).append(f)
+        sec.figures[:] = keep
+    if dropped:
+        print(f"skipping {len(dropped)} figure(s) with no image: "
+              + ", ".join(f.file for f in dropped))
 
     args.out.mkdir(parents=True, exist_ok=True)
     page = render(sections, assets, args.embed)
