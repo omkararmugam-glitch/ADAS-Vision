@@ -745,6 +745,69 @@ class DepthConfig(_Strict):
         return v
 
 
+class WeatherConfig(_Strict):
+    """Weather classification, used to scale the collision thresholds.
+
+    In the cache key: it runs a network per frame.
+
+    Attributes:
+        enabled: Off until a model is trained. The fusion engine treats an
+            unknown label as neutral (factor 1.0), so disabling it degrades to
+            dry-weather thresholds rather than failing.
+        architecture: ``resnet18`` or ``efficientnet_b0``. ResNet18 by default --
+            both saturate on this task, and ResNet18 is faster, smaller and
+            better behaved through ONNX export.
+        weights: Trained checkpoint.
+        input_size: Square input. Frames are resized, not cropped: weather
+            evidence lives in the sky and the road surface, and a centre crop
+            discards exactly those pixels.
+        device: ``auto``, ``cuda`` or ``cpu``.
+        smoothing_window: Frames in the majority-vote window. Weather does not
+            change between frames, so per-frame flicker is model noise, and
+            letting it through would modulate the collision threshold several
+            times a second.
+        switch_fraction: Share of the window a new label needs before it is
+            adopted. Must exceed 0.5, or the label oscillates.
+        every_n_frames: Classify only every Nth frame. Weather changes over
+            minutes; classifying every frame is wasted compute.
+    """
+
+    enabled: bool = False
+    architecture: str = "resnet18"
+    weights: Path = Path("models/weather_cls/weights/weather.pt")
+    input_size: int = 224
+    device: str = "auto"
+    smoothing_window: int = 30
+    switch_fraction: float = 0.6
+    every_n_frames: int = 5
+
+    @field_validator("architecture")
+    @classmethod
+    def _known_arch(cls, v: str) -> str:
+        if v not in {"resnet18", "efficientnet_b0"}:
+            raise ValueError(
+                f"weather.architecture must be 'resnet18' or 'efficientnet_b0', got '{v}'"
+            )
+        return v
+
+    @field_validator("switch_fraction")
+    @classmethod
+    def _majority(cls, v: float) -> float:
+        if not 0.5 < v <= 1.0:
+            raise ValueError(
+                f"switch_fraction must be in (0.5, 1.0]; at or below a majority "
+                f"the smoothed label would oscillate, got {v}"
+            )
+        return v
+
+    @field_validator("smoothing_window", "every_n_frames", "input_size")
+    @classmethod
+    def _positive(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"must be >= 1, got {v}")
+        return v
+
+
 class Config(_Strict):
     """Root config. Sections are added as pipeline stages land."""
 
@@ -755,6 +818,7 @@ class Config(_Strict):
     detector: DetectorConfig = Field(default_factory=DetectorConfig)
     lanes: LaneFitConfig = Field(default_factory=LaneFitConfig)
     depth: DepthConfig = Field(default_factory=DepthConfig)
+    weather: WeatherConfig = Field(default_factory=WeatherConfig)
     tracker: TrackerConfig = Field(default_factory=TrackerConfig)
     ttc: TTCConfig = Field(default_factory=TTCConfig)
     fusion: FusionConfig = Field(default_factory=FusionConfig)
@@ -768,7 +832,7 @@ class Config(_Strict):
     #: they run over cached detections in seconds; retuning an alert threshold
     #: must never re-run a network.
     CACHE_KEY_SECTIONS: ClassVar[tuple[str, ...]] = (
-        "io", "calibration", "bev", "detector", "lanes", "depth",
+        "io", "calibration", "bev", "detector", "lanes", "depth", "weather",
     )
 
     def cache_key_payload(self) -> dict[str, Any]:
