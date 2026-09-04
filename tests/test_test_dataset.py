@@ -80,10 +80,24 @@ class TestGallery:
         assert "nothing found" in out
 
     def test_the_inference_only_disclaimer_is_present(self) -> None:
-        """The gallery must never read as an evaluation. Load-bearing."""
-        out = gallery_html([_result("day", {"vehicle": 1})], "yolov8m", 0.25)
+        """The gallery must never read as an evaluation. Load-bearing.
+
+        Matched on collapsed whitespace so the assertion survives the paragraph
+        being re-wrapped -- the property matters, the line breaks do not.
+        """
+        out = " ".join(gallery_html([_result("day", {"vehicle": 1})],
+                                    "yolov8m", 0.25).split())
         assert "Inference, not evaluation" in out
         assert "no mAP is quoted" in out
+        assert "no ground truth" in out
+
+    def test_the_banner_follows_the_checkpoint(self) -> None:
+        """Calling a distilled model COCO-pretrained would simply be false."""
+        from demo.test_dataset import BANNER_COCO, BANNER_DISTILLED
+        coco = gallery_html([_result("day", {"vehicle": 1})], "m", 0.25, BANNER_COCO)
+        dist = gallery_html([_result("day", {"vehicle": 1})], "m", 0.25, BANNER_DISTILLED)
+        assert "COCO-pretrained" in coco and "COCO-pretrained" not in dist
+        assert "distillation" in dist
 
     def test_counts_reach_the_page(self) -> None:
         out = gallery_html([_result("day", {"vehicle": 3, "person": 2})], "yolov8m", 0.25)

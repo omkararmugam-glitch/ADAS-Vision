@@ -73,6 +73,35 @@ Agreement with the teacher on held-out frames, as a distillation check:
 | yolov8n, distilled | 38 | **65.8%** |
 | yolov8m, teacher | 53 | 100% (reference) |
 
+### Data-scale ablation: 50 training images
+
+Same student, same teacher, same held-out 500-image val split — only the training
+set size changed. This makes the comparison clean.
+
+| | 2,000 train images | **50 train images** |
+|---|---|---|
+| Train boxes | ~11,400 | 319 |
+| Optimiser steps | ~1,875 | ~160 |
+| mAP@0.5 | 0.610 | **0.095** |
+| mAP@0.5:0.95 | 0.410 | 0.063 |
+| Recall | 0.585 | **0.042** |
+| vehicle mAP@0.5 | 0.910 | 0.381 |
+| person mAP@0.5 | 0.663 | **0.000** |
+| bicycle mAP@0.5 | 0.591 | **0.000** |
+| motorcycle mAP@0.5 | 0.275 | **0.000** |
+
+Recall 0.042 means it finds **one object in twenty-four**. Three of the four
+classes score exactly zero.
+
+The cause is not only "too little data". Fine-tuning to a different class count
+**replaces the detection head**, which must then be relearned from scratch — and
+50 images gives roughly 160 optimiser steps to do it. A confidence sweep confirms
+the model is not blind but profoundly unconfident: its highest score on any frame
+is 0.456, and below conf 0.01 it still emits only `vehicle`.
+
+This is the same lesson the motorcycle class taught at 42 examples in the full
+run, applied to every class at once.
+
 Distillation moved the student ~6 points closer to the teacher. It also
 **amplified the teacher's ego-hood false positive** rather than fixing it — the
 student's hood box is larger and more confident than the stock model's. That is

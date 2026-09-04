@@ -94,7 +94,17 @@ def banner(vis: np.ndarray, text: str, summary: str) -> np.ndarray:
     return np.vstack([bar, vis])
 
 
-def gallery_html(results: list[Result], model: str, conf: float) -> str:
+#: Shown verbatim in the gallery banner. Keyed on whether the checkpoint was
+#: trained here, because "COCO-pretrained" is simply false for a distilled one.
+BANNER_COCO = ("These weights are COCO-pretrained and have not been fine-tuned "
+               "on this dataset.")
+BANNER_DISTILLED = ("These weights were trained here by distillation against a "
+                    "larger model&rsquo;s predictions, so they reproduce that "
+                    "teacher&rsquo;s behaviour &mdash; including its mistakes.")
+
+
+def gallery_html(results: list[Result], model: str, conf: float,
+                 banner: str = BANNER_COCO) -> str:
     cards = []
     for r in results:
         summary = ", ".join(f"{v}&nbsp;{k}" for k, v in sorted(r.counts.items())) or "nothing found"
@@ -159,10 +169,10 @@ a{{color:var(--accent)}}
 <p class="sub">{len(results)} frames from the supplied BDD100K images, sampled evenly
 across lighting conditions. Model <code>{model}</code>, confidence &ge; {conf}.
 Click any frame for full resolution.</p>
-<div class="banner"><p><strong>Inference, not evaluation.</strong> These weights are
-COCO-pretrained and have not been fine-tuned on this dataset, which shipped without
-its label file. The counts are the model&rsquo;s own output &mdash; there is no ground
-truth here to score against, so no mAP is quoted.</p></div>
+<div class="banner"><p><strong>Inference, not evaluation.</strong> {banner}
+The counts are the model&rsquo;s own output &mdash; the dataset shipped without its
+label file, so there is no ground truth here to score against and no mAP is
+quoted.</p></div>
 <table><thead><tr><th>Condition</th><th>Frames</th><th>Objects / frame</th><th>Empty</th></tr></thead>
 <tbody>{rows}</tbody></table>
 <div class="filters">
@@ -193,6 +203,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--n", type=int, default=120, help="frames to keep, balanced across bands")
     ap.add_argument("--scan", type=int, default=900, help="frames to scan when balancing")
     ap.add_argument("--conf", type=float, default=0.25)
+    ap.add_argument("--weights", type=Path, default=None,
+                    help="checkpoint to run; defaults to the configured detector")
+    ap.add_argument("--tag", default=None,
+                    help="label shown on each frame and in the gallery title")
     ap.add_argument("--seed", type=int, default=11)
     ap.add_argument("--batch", type=int, default=8)
     args = ap.parse_args(argv)
@@ -205,9 +219,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{len(paths):,} images available; scanning {len(scan)} to balance bands")
 
     cfg = load_config(PROJECT / "configs/default.yaml").detector
-    cfg = cfg.model_copy(update={"kind": "yolov8", "conf_threshold": args.conf})
+    update = {"kind": "yolov8", "conf_threshold": args.conf}
+    if args.weights is not None:
+        update["yolov8"] = cfg.yolov8.model_copy(update={"weights": args.weights})
+    cfg = cfg.model_copy(update=update)
     det = build_detector(cfg)
-    model = f"{Path(cfg.yolov8.weights).stem}"
+    model = args.tag or Path(cfg.yolov8.weights).stem
 
     img_dir = args.out / "images"
     img_dir.mkdir(parents=True, exist_ok=True)
@@ -259,8 +276,9 @@ def main(argv: list[str] | None = None) -> int:
                 f"{np.median(r.heights):.1f}" if r.heights else "",
             ])
 
+    banner = BANNER_DISTILLED if args.weights is not None else BANNER_COCO
     (args.out / "index.html").write_text(
-        gallery_html(results, model, args.conf), encoding="utf-8")
+        gallery_html(results, model, args.conf, banner), encoding="utf-8")
 
     print("=" * 66)
     print(f"{'band':8s} {'frames':>7s} {'obj/frame':>10s} {'empty':>6s} "
