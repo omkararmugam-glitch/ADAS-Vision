@@ -100,3 +100,41 @@ class TestConfigIntegration:
         cfg = WeatherConfig(enabled=True, weights="does/not/exist.pt")
         with pytest.raises(FileNotFoundError, match="weather.enabled=false"):
             WeatherClassifier(cfg)
+
+
+class TestPipelinePlumbing:
+    """Weather travels predict -> cache -> analyse. Each hop can drop it silently."""
+
+    def test_the_label_round_trips_through_a_frame_record(self) -> None:
+        import numpy as np
+        from core.types import FrameRecord, FrameResult, LaneSet, LaneStatus
+
+        blank = np.zeros((8, 8), np.uint8)
+        rec = FrameRecord(
+            frame_index=3, source_index=3, timestamp_s=0.12,
+            result=FrameResult(
+                boxes_px=np.zeros((0, 4), np.float32),
+                class_ids=np.zeros(0, np.int32), scores=np.zeros(0, np.float32),
+                drivable_mask=blank, lane_mask=blank.copy()),
+            lanes=LaneSet(status=LaneStatus.NOT_DETECTED),
+            extras={"was_resized": False, "weather": "rain"},
+        )
+        restored = FrameRecord.from_dict(rec.to_dict(), blank, blank.copy())
+        assert restored.extras["weather"] == "rain"
+
+    def test_a_missing_label_is_neutral_not_an_error(self) -> None:
+        """An old cache written before weather existed must still analyse."""
+        from core.config import FusionConfig
+        from fusion.engine import DecisionEngine
+
+        engine = DecisionEngine(FusionConfig(ttc_warning_s=2.5))
+        engine.set_weather({}.get("weather", "unknown"))
+        assert engine.ttc_thresholds()[0] == pytest.approx(2.5)
+
+    def test_a_cached_rain_label_widens_the_threshold(self) -> None:
+        from core.config import FusionConfig
+        from fusion.engine import DecisionEngine
+
+        engine = DecisionEngine(FusionConfig(ttc_warning_s=2.5))
+        engine.set_weather({"weather": "rain"}.get("weather", "unknown"))
+        assert engine.ttc_thresholds()[0] > 2.5

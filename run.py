@@ -28,6 +28,7 @@ from core.logging_utils import StageTimer, get_logger, log_kv
 from core.overlay import VideoWriter, annotate, lane_hud_lines
 from core.types import FrameRecord, FrameResult, LaneStatus, class_name
 from fusion.engine import DecisionEngine
+from models.weather_cls.classifier import WeatherClassifier
 from fusion.log import AlertLog
 from tracking.bytetrack import ByteTracker
 from tracking.collision import CollisionEstimator
@@ -85,11 +86,30 @@ def _open_cache(cfg: Config, source: str, camera: CameraModel, detector: Detecto
 # --------------------------------------------------------------------------- #
 
 
+def _build_weather(cfg: Config) -> WeatherClassifier | None:
+    """Build the weather classifier, or None when it is off or unavailable.
+
+    A missing checkpoint downgrades to None rather than raising: the fusion
+    engine treats an unknown label as neutral, so losing weather means dry
+    thresholds, not a dead pipeline.
+    """
+    if not cfg.weather.enabled:
+        return None
+    try:
+        return WeatherClassifier(cfg.weather)
+    except Exception as exc:                          # noqa: BLE001 - deliberate
+        log_kv(_log, logging.WARNING, "weather.unavailable",
+               error=str(exc)[:160],
+               note="continuing with neutral (dry) collision thresholds")
+        return None
+
+
 def cmd_predict(args: argparse.Namespace) -> int:
     cfg = _apply_overrides(load_config(args.config), args)
     camera = _load_camera(cfg)
     detector = build_detector(cfg.detector, camera)
 
+    weather = _build_weather(cfg)
     cache = _open_cache(cfg, args.source, camera, detector)
     if args.refresh:
         cache.invalidate()
@@ -101,6 +121,10 @@ def cmd_predict(args: argparse.Namespace) -> int:
         return 0
 
     resume_after = 0 if args.refresh else cache.resumable_frames()
+    # Weather changes over minutes, so it is classified every Nth frame and the
+    # label carried forward. Cached per frame because it comes from a network
+    # and `analyse` must not need one.
+    last_weather = "unknown"
     frame_camera: CameraModel | None = None
     fitter: LaneFitter | None = None
     counts: dict[str, int] = {}
@@ -109,13 +133,20 @@ def cmd_predict(args: argparse.Namespace) -> int:
         with StageTimer("predict", _log) as timer:
             batch: list = []
 
+            def _set_last_weather(value: str) -> None:
+                nonlocal last_weather
+                last_weather = value
+
             def flush() -> None:
                 nonlocal batch
                 if not batch:
                     return
                 results = detector.infer_batch([f.image for f in batch])
+                nonlocal_weather = last_weather
                 for frame, result in zip(batch, results):
                     lanes = fitter.fit(result.lane_mask)
+                    if weather is not None and frame.index % cfg.weather.every_n_frames == 0:
+                        nonlocal_weather = weather.infer_smoothed(frame.image).fusion_label
                     for cid in result.class_ids:
                         name = class_name(int(cid))
                         counts[name] = counts.get(name, 0) + 1
@@ -129,11 +160,13 @@ def cmd_predict(args: argparse.Namespace) -> int:
                             timestamp_s=frame.timestamp_s,
                             result=result,
                             lanes=lanes,
-                            extras={"was_resized": frame.was_resized},
+                            extras={"was_resized": frame.was_resized,
+                                    "weather": nonlocal_weather},
                         ),
                         result,
                     )
                     timer.tick()
+                _set_last_weather(nonlocal_weather)
                 batch = []
 
             for frame in src:
@@ -159,6 +192,8 @@ def cmd_predict(args: argparse.Namespace) -> int:
             flush()
 
     detector.close()
+    if weather is not None:
+        weather.close()
     log_kv(_log, logging.INFO, "predict.counts", **{k: v for k, v in sorted(counts.items())})
     _print_summary(cache, rendered=None, counts=counts)
     return 0
@@ -183,6 +218,7 @@ def analyse_cache(cfg: Config, cache: RunCache, camera: CameraModel) -> AlertLog
     log = AlertLog()
 
     for record in cache.read(with_masks=False):
+        engine.set_weather(record.extras.get("weather", "unknown"))
         tracks = tracker.update(record.result, record.frame_index, record.timestamp_s)
         objects = collisions.update(tracks, record.timestamp_s)
         log.add(engine.update(
@@ -281,6 +317,7 @@ def cmd_render(args: argparse.Namespace) -> int:
         engine = DecisionEngine(cfg.fusion)
         for idx in sorted(records):
             rec = records[idx]
+            engine.set_weather(rec.extras.get("weather", "unknown"))
             tracks = tracker.update(rec.result, rec.frame_index, rec.timestamp_s)
             objs = collisions.update(tracks, rec.timestamp_s)
             objects_by_frame[idx] = objs
