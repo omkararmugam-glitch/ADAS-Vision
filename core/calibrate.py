@@ -851,6 +851,91 @@ def _cmd_verify(args: argparse.Namespace, cfg: Config) -> int:
     return 0
 
 
+def _cmd_autocalib(args: argparse.Namespace, cfg: Config) -> int:
+    """Estimate a homography from road geometry, with no calibration target.
+
+    A fallback for supplied footage where the camera is long gone. Every
+    assumption is written into the YAML so a distance derived from it can never
+    later be mistaken for the product of a measured calibration.
+    """
+    from core.autocalib import estimate
+    from core.io import open_source
+
+    frames: list[np.ndarray] = []
+    # Calibration reads still frames; their capture rate is irrelevant here.
+    # io.image_dir_fps is deliberately null in the shipped config so that a
+    # TIMING-sensitive run cannot silently assume one -- but this command has no
+    # timing, so it supplies a value locally rather than forcing the user to set
+    # a global that would then leak into predict.
+    io_cfg = cfg.io if cfg.io.image_dir_fps else cfg.io.model_copy(
+        update={"image_dir_fps": 30.0})
+    with open_source(args.source, io_cfg) as src:
+        for i, frame in enumerate(src):
+            if i >= args.frames:
+                break
+            frames.append(frame.image)
+    if not frames:
+        raise SystemExit(f"no frames read from {args.source}")
+
+    est = estimate(
+        frames, hfov_deg=args.hfov, camera_height_m=args.height,
+        lane_width_m=args.lane_width,
+    )
+    if est is None:
+        raise SystemExit(
+            "auto-calibration refused: the frames did not yield a plausible "
+            "road vanishing point. This happens with no visible lane markings, "
+            "heavy occlusion, or an urban scene where building edges dominate. "
+            "Refusing is deliberate -- an invented homography produces confident, "
+            "wrong distances. Use `calibrate homography` with a chessboard, or "
+            "pass frames from a stretch of open road."
+        )
+
+    size = (frames[0].shape[1], frames[0].shape[0])
+    camera = CameraModel(
+        H_image_to_ground=est.H_image_to_ground,
+        image_size=size,
+        residual_m=float("nan"),        # nothing was measured to residual against
+        undistort_applied=False,
+    )
+    out = Path(args.out or cfg.calibration.homography_path)
+    camera.save(out)
+
+    # Append provenance the CameraModel schema does not itself carry.
+    import yaml as _yaml
+    doc = _yaml.safe_load(out.read_text(encoding="utf-8"))
+    doc["method"] = "autocalib"
+    doc["autocalib"] = {
+        "vanishing_point_px": [round(v, 1) for v in est.vanishing_point],
+        "horizon_row_px": round(est.horizon_v, 1),
+        "pitch_deg": round(float(np.rad2deg(est.pitch_rad)), 3),
+        "yaw_deg": round(float(np.rad2deg(est.yaw_rad)), 3),
+        "focal_px": round(est.focal_px, 1),
+        "camera_height_m": est.camera_height_m,
+        "lane_width_m": est.lane_width_m,
+        "lines_used": est.n_lines,
+        "inlier_ratio": round(est.inlier_ratio, 3),
+        "assumptions": est.assumptions,
+        "WARNING": (
+            "ESTIMATED, NOT MEASURED. Distances scale linearly with the assumed "
+            "camera height and lane width. Treat every metric output as indicative."
+        ),
+    }
+    out.write_text(_yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+
+    print("=" * 70)
+    print(f"auto-calibration written to {out}")
+    print(f"  horizon row   : {est.horizon_v:.1f} px")
+    print(f"  pitch / yaw   : {np.rad2deg(est.pitch_rad):+.2f} / "
+          f"{np.rad2deg(est.yaw_rad):+.2f} deg")
+    print(f"  lines / inlier: {est.n_lines} / {est.inlier_ratio:.2f}")
+    print("  assumptions   :")
+    for a in est.assumptions:
+        print(f"      - {a}")
+    print("=" * 70)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="calibrate", description="Camera intrinsics and ground-plane homography."
@@ -881,6 +966,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_hom.add_argument("--far", type=float, default=30.0, help="far edge distance, metres")
     p_hom.add_argument("--out", default=None, help="output YAML (default: from config)")
     p_hom.set_defaults(func=_cmd_homography)
+
+    p_auto = sub.add_parser(
+        "auto", help="estimate a homography from road geometry (no target needed)")
+    p_auto.add_argument("--source", required=True, help="video or image folder")
+    p_auto.add_argument("--frames", type=int, default=12,
+                        help="frames to pool; markings are dashed, so more helps")
+    p_auto.add_argument("--hfov", type=float, default=90.0,
+                        help="assumed horizontal field of view, degrees")
+    p_auto.add_argument("--height", type=float, default=1.35,
+                        help="assumed camera height in metres; scales ALL distances")
+    p_auto.add_argument("--lane-width", type=float, default=3.5)
+    p_auto.add_argument("--out", default=None)
+    p_auto.set_defaults(func=_cmd_autocalib)
 
     p_ver = sub.add_parser("verify", help="warp to bird's-eye and overlay a metre grid")
     p_ver.add_argument("--source", required=True, help="video file or image folder")
