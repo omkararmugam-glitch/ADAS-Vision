@@ -138,3 +138,83 @@ class TestContactSheet:
         out = contact_sheet(paths, tmp_path / "sheet.jpg", cols=4, width=160)
         img = cv2.imread(str(out))
         assert img.shape[0] > 90, "the fifth image must occupy a second row"
+
+
+class TestDistanceLines:
+    """Lines from the ego to each object, labelled in metres."""
+
+    @staticmethod
+    def _obj(distance, box=(300.0, 300, 400, 400), name="vehicle", in_path=True):
+        from tracking.collision import ObjectState
+        from tracking.ttc import NO_COLLISION, TTCEstimate
+        return ObjectState(
+            track_id=1, class_name=name, box_px=np.array(box), score=0.9,
+            distance_m=distance, lateral_offset_m=0.0,
+            ttc=TTCEstimate(ttc_s=NO_COLLISION), in_path=in_path,
+        )
+
+    @staticmethod
+    def _camera():
+        from core.calibrate import CameraModel
+        return CameraModel(H_image_to_ground=np.eye(3), image_size=(640, 480))
+
+    def _blank(self):
+        return np.full((480, 640, 3), 40, np.uint8)
+
+    def test_a_line_is_drawn_for_a_measured_object(self) -> None:
+        from core.overlay import draw_distance_lines
+        img = self._blank()
+        out = draw_distance_lines(img, [self._obj(12.0)], self._camera(), OverlayConfig())
+        assert not np.array_equal(img, out)
+
+    def test_an_object_with_no_distance_draws_nothing(self) -> None:
+        """Without calibration there is no metre value to put on the line."""
+        from core.overlay import draw_distance_lines
+        img = self._blank()
+        out = draw_distance_lines(img, [self._obj(None)], self._camera(), OverlayConfig())
+        assert np.array_equal(img, out)
+
+    def test_no_objects_draws_nothing(self) -> None:
+        from core.overlay import draw_distance_lines
+        img = self._blank()
+        assert np.array_equal(img, draw_distance_lines(img, [], self._camera(), OverlayConfig()))
+
+    def test_distant_objects_are_dropped(self) -> None:
+        """A confidently-labelled 90 m line implies precision that does not exist."""
+        from core.overlay import draw_distance_lines
+        img = self._blank()
+        out = draw_distance_lines(img, [self._obj(90.0)], self._camera(),
+                                  OverlayConfig(), max_distance_m=60.0)
+        assert np.array_equal(img, out)
+
+    def test_only_the_nearest_few_are_drawn(self) -> None:
+        """Twenty lines at a junction is an unreadable fan."""
+        from core.overlay import draw_distance_lines
+        objs = [self._obj(float(5 + i), box=(50.0 + 20 * i, 300, 90.0 + 20 * i, 380))
+                for i in range(10)]
+        few = draw_distance_lines(self._blank(), objs, self._camera(),
+                                  OverlayConfig(), max_lines=2)
+        many = draw_distance_lines(self._blank(), objs, self._camera(),
+                                   OverlayConfig(), max_lines=8)
+        assert int((few != 40).sum()) < int((many != 40).sum())
+
+    def test_in_path_filter_is_honoured(self) -> None:
+        from core.overlay import draw_distance_lines
+        img = self._blank()
+        out = draw_distance_lines(img, [self._obj(10.0, in_path=False)], self._camera(),
+                                  OverlayConfig(), in_path_only=True)
+        assert np.array_equal(img, out)
+
+    def test_the_source_frame_is_not_modified(self) -> None:
+        from core.overlay import draw_distance_lines
+        img = self._blank()
+        before = img.copy()
+        draw_distance_lines(img, [self._obj(10.0)], self._camera(), OverlayConfig())
+        assert np.array_equal(img, before)
+
+    def test_a_non_finite_distance_is_ignored(self) -> None:
+        from core.overlay import draw_distance_lines
+        img = self._blank()
+        out = draw_distance_lines(img, [self._obj(float("inf"))], self._camera(),
+                                  OverlayConfig())
+        assert np.array_equal(img, out)

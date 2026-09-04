@@ -217,6 +217,7 @@ more than a picture, so a preview failure prints and continues.
 | Boxes, class, confidence | Ultralytics `results.plot()` for plain detection previews; `core/overlay.draw_boxes` in the pipeline |
 | Track id (`#7`) | `core/overlay.draw_boxes`, ahead of the class name |
 | Distance in metres | `core/overlay.draw_boxes`, when calibration is available |
+| Distance **line** ego to object | `core/overlay.draw_distance_lines` |
 | Lane fits and masks | `core/overlay.draw_lane_fits`, `draw_mask` |
 | Weather / road condition | `core/overlay.draw_status_corner`, top-right |
 | Fusion alerts | `core/overlay.draw_hud` warning rows, top-left |
@@ -226,6 +227,19 @@ is maintained, it matches what anyone familiar with YOLO expects, and a second
 copy of box-drawing code would drift. Custom drawing is used only where
 `plot()` cannot help — lane geometry, track ids, the classification corner and
 fusion alerts, none of which Ultralytics knows about.
+
+**Distance lines run to the ground-contact point**, not the box centre. The
+contact point is the only part of a 2-D box that lies on the road and therefore
+the only part the homography can place; drawing to the centre would look tidier
+and be wrong by however tall the object is. Only the nearest few are drawn, and
+nothing beyond 60 m — monocular error grows with the square of range, and a
+confidently-labelled 90 m line implies a precision that does not exist.
+
+**Previews composite lanes even when no objects are detected.** An empty road
+with its markings drawn is a correct and informative result; a blank frame reads
+as "the system found nothing" when the truth is "the system was only asked about
+vehicles". An *implausible* lane mask is still not painted — sky and foliage in
+lane colour looks like a confident detection and is read as one.
 
 **The status corner suppresses `unknown`.** A corner permanently reading
 "weather: unknown" trains the eye to skip the whole region, including the frames

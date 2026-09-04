@@ -37,7 +37,7 @@ sys.path.insert(0, str(PROJECT))
 from core.autocalib import estimate as autocalib_estimate
 from core.calibrate import CameraModel
 from core.config import load_config
-from core.overlay import annotate, draw_split, lane_hud_lines
+from core.overlay import annotate, draw_distance_lines, draw_split, lane_hud_lines
 from core.types import CLASS_IDS, FrameResult, LaneStatus, class_name
 from fusion.engine import DecisionEngine
 from models.lane_seg.classical import ClassicalLaneSegmenter
@@ -75,6 +75,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="detector checkpoint; defaults to the configured one")
     ap.add_argument("--n", type=int, default=8)
     ap.add_argument("--conf", type=float, default=0.25)
+    ap.add_argument("--stills", action="store_true", default=True,
+                    help="treat inputs as non-consecutive frames (the default for "
+                         "an image directory)")
+    ap.add_argument("--video-sequence", dest="stills", action="store_false",
+                    help="inputs are consecutive video frames, so tracks can build")
     args = ap.parse_args(argv)
 
     frames_paths = _sequence(args.images, args.n)
@@ -107,7 +112,16 @@ def main(argv: list[str] | None = None) -> int:
               "lane geometry and distance will be unavailable")
 
     fitter = LaneFitter(camera, cfg.bev, cfg.lanes) if camera else None
-    tracker = ByteTracker(cfg.tracker)
+    # On sampled stills a track can never reach n_init consecutive matches, so
+    # every object stays unconfirmed and NOTHING gets a distance -- the tracker
+    # silently suppresses the whole metric overlay. Confirming immediately is
+    # the right trade here: the ids are not meaningful across non-consecutive
+    # frames anyway, but the distances are.
+    track_cfg = cfg.tracker.model_copy(update={"n_init": 1}) if args.stills else cfg.tracker
+    if args.stills:
+        print("stills mode: tracks confirm immediately (ids are per-frame, "
+              "distances are real)")
+    tracker = ByteTracker(track_cfg)
     collisions = CollisionEstimator(cfg.ttc, camera)
     engine = DecisionEngine(cfg.fusion)
     light_id = CLASS_IDS["traffic_light"]
@@ -206,6 +220,8 @@ def main(argv: list[str] | None = None) -> int:
             track_ids=track_ids, distances_m=distances,
             weather=None, road_condition=None,
         )
+        if camera is not None and objects:
+            vis = draw_distance_lines(vis, objects, camera, cfg.overlay)
         if split is not None and camera is not None:
             vis = draw_split(vis, split, lanes, camera, cfg.overlay)
         dst = args.out / f"{i:03d}_{path.stem}.jpg"

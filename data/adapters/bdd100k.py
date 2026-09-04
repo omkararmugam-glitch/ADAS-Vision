@@ -209,6 +209,15 @@ def write_split(
     img_out.mkdir(parents=True, exist_ok=True)
     lab_out.mkdir(parents=True, exist_ok=True)
     index = {c: i for i, c in enumerate(classes)}
+    # A class the caller did not declare would otherwise surface as a bare
+    # KeyError deep in the write loop, after all the expensive work is done.
+    unknown = {b[0] for r in records for b in r.boxes} - set(index)
+    if unknown:
+        raise ValueError(
+            f"records contain classes not in the declared list: {sorted(unknown)}. "
+            f"Declared: {classes}. Pass the full vocabulary (core.types.CLASS_NAMES) "
+            f"rather than a hand-listed subset."
+        )
     counts: Counter = Counter()
 
     for r in records:

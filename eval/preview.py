@@ -70,6 +70,10 @@ def _banner(img: np.ndarray, text: str, sub: str = "") -> np.ndarray:
     return np.vstack([bar, img])
 
 
+#: Lane markings are drawn in this colour over the detector's own rendering.
+LANE_OVERLAY_COLOR = (255, 90, 200)
+
+
 def save_yolo_previews(
     weights: Path,
     images: list[Path],
@@ -77,18 +81,32 @@ def save_yolo_previews(
     conf: float = 0.25,
     title: str = "",
     subtitle: str = "",
+    with_lanes: bool = True,
 ) -> list[Path]:
-    """Annotate images with a YOLO checkpoint, using Ultralytics' own plotting.
+    """Annotate images with a YOLO checkpoint, plus lane markings.
 
-    ``results.plot()`` rather than custom drawing, deliberately: it is the
-    library's maintained renderer, so the previews look like what anyone
-    familiar with YOLO expects, and there is no second copy of box-drawing code
-    to drift.
+    ``results.plot()`` handles the boxes -- it is the library's maintained
+    renderer, so previews look like what anyone familiar with YOLO expects and
+    there is no second copy of box-drawing code to drift.
+
+    Lanes are composited on top, because ``plot()`` knows nothing about them.
+    Without this a frame containing no vehicles came out **completely
+    unannotated**, which reads as "the system found nothing" when the truth is
+    "the system was only ever asked about vehicles". An empty road with its lane
+    markings drawn is a correct and informative result; a blank frame is not.
+
+    Args:
+        with_lanes: Overlay classical lane segmentation. Off only for a strict
+            detector-vs-detector comparison, where extra ink would obscure the
+            difference being examined.
     """
     from ultralytics import YOLO
 
+    from models.lane_seg.classical import ClassicalLaneSegmenter
+
     out_dir.mkdir(parents=True, exist_ok=True)
     model = YOLO(str(weights))
+    segmenter = ClassicalLaneSegmenter() if with_lanes else None
     written: list[Path] = []
     for path in images:
         frame = cv2.imread(str(path))
@@ -96,9 +114,29 @@ def save_yolo_previews(
             continue
         result = model.predict(source=frame, conf=conf, verbose=False)[0]
         vis = result.plot()                       # Ultralytics' own renderer
+
+        lane_note = ""
+        if segmenter is not None:
+            lane = segmenter.infer_detailed(frame)
+            # Only paint a mask that passed the plausibility check. An
+            # implausible one -- sky, foliage, a wall of night-time noise --
+            # painted over the frame is worse than nothing: it looks like a
+            # confident lane detection and is read as one. Saying "none found"
+            # is the honest and more useful output.
+            if lane.is_plausible:
+                vis[lane.mask > 0] = LANE_OVERLAY_COLOR
+                lane_note = f"lane {lane.coverage * 100:.2f}%"
+            else:
+                lane_note = f"lane: none found ({lane.coverage * 100:.2f}% rejected)"
+
         n = 0 if result.boxes is None else len(result.boxes)
         if title:
-            vis = _banner(vis, f"{title}   {path.name}   {n} detections", subtitle)
+            # State the count even when it is zero. "0 detections" on a visibly
+            # empty road is a result; an unlabelled frame is ambiguous.
+            head = f"{title}   {path.name}   {n} detections"
+            if lane_note:
+                head += f"   {lane_note}"
+            vis = _banner(vis, head, subtitle)
         dst = out_dir / f"{path.stem}.jpg"
         cv2.imwrite(str(dst), vis, [cv2.IMWRITE_JPEG_QUALITY, 88])
         written.append(dst)
@@ -122,7 +160,7 @@ def save_training_previews(
     sub = ("targets are PSEUDO-labels: agreement with the teacher, not correctness"
            if label_source == "pseudo" else "")
     return save_yolo_previews(weights, images, out, conf,
-                              title=f"epoch {epoch}", subtitle=sub)
+                              title=f"epoch {epoch}", subtitle=sub, with_lanes=True)
 
 
 def save_eval_previews(
@@ -140,7 +178,7 @@ def save_eval_previews(
     sub = ("targets are PSEUDO-labels: agreement with the teacher, not correctness"
            if label_source == "pseudo" else "")
     return save_yolo_previews(weights, images, Path(out_dir), conf,
-                              title="eval", subtitle=sub)
+                              title="eval", subtitle=sub, with_lanes=True)
 
 
 def contact_sheet(

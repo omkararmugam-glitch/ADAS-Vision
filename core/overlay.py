@@ -232,6 +232,71 @@ def draw_hud(
     return vis
 
 
+def draw_distance_lines(
+    image: np.ndarray,
+    objects,
+    camera: CameraModel,
+    cfg: OverlayConfig,
+    max_lines: int = 4,
+    max_distance_m: float = 60.0,
+    in_path_only: bool = False,
+) -> np.ndarray:
+    """Draw a line from the ego vehicle to each detected object, labelled in metres.
+
+    The line runs from the camera's own ground projection -- the point directly
+    beneath the vehicle's nose -- to the object's ground-contact point, which is
+    the only part of a 2-D box that lies on the road and therefore the only part
+    the homography can place. Drawing to the box centre instead would look
+    tidier and be wrong by however tall the object is.
+
+    Two limits, both about legibility rather than correctness. Only the nearest
+    ``max_lines`` are drawn: a busy junction has twenty tracked objects and
+    twenty lines is an unreadable fan. And nothing beyond ``max_distance_m``,
+    because monocular distance error grows with the square of range and a
+    confidently-labelled 90 m line implies a precision that does not exist.
+    """
+    usable = [
+        o for o in objects
+        if getattr(o, "distance_m", None) is not None
+        and np.isfinite(o.distance_m)
+        and 0 < o.distance_m <= max_distance_m
+        and (o.in_path if in_path_only else True)
+    ]
+    if not usable:
+        return image
+    usable.sort(key=lambda o: o.distance_m)
+    usable = usable[:max_lines]
+
+    vis = image.copy()
+    # Ego origin: the camera's ground projection, at zero lateral offset and a
+    # short distance ahead. Exactly zero is on the horizon-free singular row, so
+    # a small positive offset is used.
+    origin = np.asarray(camera.ground_to_image(np.array([[0.0, 0.5]]))).reshape(-1, 2)
+    if not len(origin) or not np.isfinite(origin[0]).all():
+        ego_px = (vis.shape[1] // 2, vis.shape[0] - 1)
+    else:
+        ego_px = (int(round(origin[0, 0])), min(vis.shape[0] - 1, int(round(origin[0, 1]))))
+
+    for obj in usable:
+        box = np.asarray(obj.box_px).reshape(4)
+        contact = (int(round(0.5 * (box[0] + box[2]))), int(round(box[3])))
+        colour = label_color(obj.class_name)
+
+        cv2.line(vis, ego_px, contact, colour, 2, cv2.LINE_AA)
+        cv2.circle(vis, contact, 4, colour, -1, cv2.LINE_AA)
+
+        text = f"{obj.distance_m:.1f} m"
+        if getattr(obj, "ttc", None) is not None and np.isfinite(obj.ttc.ttc_s):
+            text += f"  {obj.ttc.ttc_s:.1f}s"
+        mid = ((ego_px[0] + contact[0]) // 2, (ego_px[1] + contact[1]) // 2)
+        (tw, th), base = cv2.getTextSize(text, FONT, cfg.font_scale, 1)
+        x = int(np.clip(mid[0] - tw // 2, 0, vis.shape[1] - tw - 6))
+        y = int(np.clip(mid[1], th + 4, vis.shape[0] - 4))
+        cv2.rectangle(vis, (x - 3, y - th - base), (x + tw + 3, y + base), (24, 24, 24), -1)
+        cv2.putText(vis, text, (x, y), FONT, cfg.font_scale, colour, 1, cv2.LINE_AA)
+    return vis
+
+
 def draw_split(
     image: np.ndarray,
     split,
