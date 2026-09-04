@@ -22,6 +22,7 @@ class AlertType(str, Enum):
     PEDESTRIAN_IN_PATH = "pedestrian_in_path"
     RED_LIGHT_RUNNING = "red_light_running"
     ROAD_HAZARD = "road_hazard"
+    ROAD_SPLIT = "road_split"
     LANE_LOST = "lane_lost"
 
 

@@ -148,11 +148,23 @@ def lane_mask(
     combined = cv2.morphologyEx(
         combined, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     )
+    # Thinness is measured with a rotated rectangle, NOT the axis-aligned
+    # bounding box. A lane marking seen in perspective runs diagonally, and its
+    # bounding box is then wide even though the stripe is a few pixels across --
+    # so a bounding-box width test rejects exactly the angled markings that
+    # carry the most information about where the lane goes. minAreaRect gives
+    # the true stripe width whatever its orientation.
     max_width = max(3, int(MAX_STRIPE_FRAC * w))
     n, labels, stats, _ = cv2.connectedComponentsWithStats(combined, connectivity=8)
     keep = np.zeros_like(combined)
     for i in range(1, n):
-        if stats[i, cv2.CC_STAT_WIDTH] <= max_width and stats[i, cv2.CC_STAT_AREA] >= 12:
+        if stats[i, cv2.CC_STAT_AREA] < 12:
+            continue
+        pts = cv2.findNonZero((labels == i).astype(np.uint8))
+        if pts is None:
+            continue
+        (_, _), (rw, rh), _ = cv2.minAreaRect(pts)
+        if min(rw, rh) <= max_width:
             keep[labels == i] = 255
 
     roi_area = int(roi.sum())

@@ -37,11 +37,12 @@ sys.path.insert(0, str(PROJECT))
 from core.autocalib import estimate as autocalib_estimate
 from core.calibrate import CameraModel
 from core.config import load_config
-from core.overlay import annotate, lane_hud_lines
+from core.overlay import annotate, draw_split, lane_hud_lines
 from core.types import CLASS_IDS, FrameResult, LaneStatus, class_name
 from fusion.engine import DecisionEngine
 from models.lane_seg.classical import ClassicalLaneSegmenter
 from models.lane_seg.fitting import LaneFitter
+from models.lane_seg.split import detect_split
 from models.perception.factory import build_detector
 from models.perception.traffic_light import classify_lights
 from tracking.bytetrack import ByteTracker, iou_matrix
@@ -147,6 +148,11 @@ def main(argv: list[str] | None = None) -> int:
                         objects[j] = replace(objects[j], light_state=st)
 
         decision = engine.update(i, timestamp, objects, lanes)
+        split = detect_split(
+            lanes,
+            min_divergence_ratio=cfg.fusion.lane_change.split_min_ratio,
+            min_widening_m=cfg.fusion.lane_change.split_min_widening_m,
+        )
 
         # Map detections to track ids and distances by overlap, not index.
         track_ids, distances = {}, {}
@@ -176,6 +182,9 @@ def main(argv: list[str] | None = None) -> int:
         ]
         if lights_txt:
             hud.append(f"lights : {lights_txt}")
+        if split is not None:
+            hud.append(f"split  : {split.side.value} at {split.gore_distance_m:.0f} m "
+                       f"(x{split.divergence_ratio:.1f})")
         if objects:
             nearest = min((o for o in objects if o.distance_m is not None),
                           key=lambda o: o.distance_m, default=None)
@@ -197,6 +206,8 @@ def main(argv: list[str] | None = None) -> int:
             track_ids=track_ids, distances_m=distances,
             weather=None, road_condition=None,
         )
+        if split is not None and camera is not None:
+            vis = draw_split(vis, split, lanes, camera, cfg.overlay)
         dst = args.out / f"{i:03d}_{path.stem}.jpg"
         cv2.imwrite(str(dst), vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
         written.append(dst)

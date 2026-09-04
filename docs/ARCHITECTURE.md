@@ -285,6 +285,39 @@ figures are for exact synthetic boxes on perfectly flat ground — they validate
 the *geometry*, and say nothing about real-world accuracy, which is dominated by
 the error sources tabulated above.
 
+## Road splits — forks, exit ramps, dividing carriageways
+
+The lane fitter assumes one continuous road with roughly parallel boundaries.
+Where the road actually divides, that assumption fails **silently and in the
+worst way**: the gore between the two carriageways reads as one very wide lane,
+`lane_width_m` grows past anything plausible, and the ego offset the
+lane-departure rule depends on stops meaning anything. Nothing raises. The
+system simply believes it is centred in a nine-metre lane.
+
+Detection works on the **fitted boundaries**, not the mask. Two boundaries
+belonging to one road stay roughly parallel — their separation at 30 m is close
+to their separation at 10 m. Two boundaries either side of a fork do not; the gap
+opens with distance, which is what a driver sees as the road dividing.
+
+The test is a **ratio**, not an absolute width, so it holds for a narrow urban
+lane and a wide motorway alike; a fixed threshold would fire on one and miss the
+other. An absolute widening is required as well, because the ratio alone fires on
+boundaries that start very close together.
+
+Two deliberate limits:
+
+* **It never claims a split from one frame.** A single bad lane fit — a kerb
+  taken as a boundary, a shadow edge — produces exactly a fork's signature.
+  `SplitTracker` requires agreement across several frames in a window, which
+  costs a few frames against a fork that stays visible for seconds.
+* **It does not guess which branch the vehicle will take.** That needs indicator
+  state or a route, neither of which exists here, and a confident wrong answer
+  is worse than "the road divides ahead", which is both true and useful.
+
+Rendered in its own colour, distinct from every lane role, with a marker at the
+gore nose. A fork changes what the lane geometry *means*, so it must not read as
+one more boundary among the others.
+
 ## Lane departure and lane change
 
 Both from one signal: lateral offset normalised by half the lane width, so

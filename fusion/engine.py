@@ -23,6 +23,7 @@ from core.config import FusionConfig
 from core.types import ROAD_USER_CLASSES, LaneSet, LaneStatus
 from fusion.alerts import Alert, AlertType, FrameDecision, Severity
 from fusion.lane_change import LaneChangeDetector, LaneEvent, LaneState
+from models.lane_seg.split import SplitTracker, detect_split
 from tracking.collision import ObjectState
 
 #: Classes treated as vulnerable road users. A pedestrian anywhere near the path
@@ -37,6 +38,9 @@ class DecisionEngine:
     def __init__(self, cfg: FusionConfig) -> None:
         self.cfg = cfg
         self.lane_detector = LaneChangeDetector(cfg.lane_change)
+        lc = cfg.lane_change
+        self.split_tracker = SplitTracker(
+            lc.split_min_frames, lc.split_window, lc.split_cooldown_frames)
         self._weather = "unknown"
 
     def set_weather(self, weather: str) -> None:
@@ -74,6 +78,7 @@ class DecisionEngine:
             self._collision_alerts(frame_index, timestamp_s, objects, warn_s, crit_s)
         )
         alerts.extend(self._signal_alerts(frame_index, timestamp_s, objects))
+        alerts.extend(self._split_alerts(frame_index, timestamp_s, lanes))
 
         # Most urgent first, so an overlay that shows only one shows the worst.
         alerts.sort(key=lambda a: -a.severity.rank)
@@ -174,6 +179,45 @@ class DecisionEngine:
             ))
         return out
 
+    def _split_alerts(
+        self, frame_index: int, timestamp_s: float, lanes: LaneSet
+    ) -> list[Alert]:
+        """Report a fork, exit ramp or dividing carriageway ahead.
+
+        Informational rather than a warning: a road dividing is not a hazard, it
+        is a fact the driver needs and the lane logic needs to know about. It is
+        raised because the lane-departure rule silently misbehaves across a
+        gore -- the widening gap reads as one very wide lane, and the ego offset
+        that rule depends on stops meaning anything.
+        """
+        lc = self.cfg.lane_change
+        if not lc.detect_split:
+            return []
+        found = detect_split(
+            lanes,
+            min_divergence_ratio=lc.split_min_ratio,
+            min_widening_m=lc.split_min_widening_m,
+        )
+        confirmed = self.split_tracker.update(found)
+        if confirmed is None:
+            return []
+        where = ("" if confirmed.side.value == "unknown"
+                 else f" ({confirmed.side.value} branch)")
+        return [Alert(
+            type=AlertType.ROAD_SPLIT,
+            severity=Severity.INFO,
+            frame_index=frame_index, timestamp_s=timestamp_s,
+            message=f"Road splits ahead{where}",
+            evidence={
+                "side": confirmed.side.value,
+                "gore_distance_m": confirmed.gore_distance_m,
+                "near_separation_m": confirmed.near_separation_m,
+                "far_separation_m": confirmed.far_separation_m,
+                "divergence_ratio": confirmed.divergence_ratio,
+                "boundaries": f"{confirmed.left_role}|{confirmed.right_role}",
+            },
+        )]
+
     def _signal_alerts(
         self, frame_index: int, timestamp_s: float, objects: list[ObjectState]
     ) -> list[Alert]:
@@ -259,4 +303,5 @@ class DecisionEngine:
 
     def reset(self) -> None:
         self.lane_detector.reset()
+        self.split_tracker.reset()
         self._weather = "unknown"

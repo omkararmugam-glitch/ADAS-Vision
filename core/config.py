@@ -585,6 +585,18 @@ class LaneChangeConfig(_Strict):
         history_window: Offsets retained, for the confidence figure.
         min_plausible_width_m, max_plausible_width_m: A fit outside this band is
             rejected as a mis-lock rather than trusted.
+        detect_split: Report forks, exit ramps and dividing carriageways.
+        split_min_ratio: Far-over-near boundary separation above which a pair
+            counts as diverging. A ratio rather than an absolute width, so it
+            holds for a narrow urban lane and a wide motorway alike.
+        split_min_widening_m: Absolute growth also required, since the ratio
+            alone fires on boundaries that start very close together.
+        split_min_frames: Frames within `split_window` that must agree before a
+            split is reported. One bad lane fit produces the same signature as a
+            real fork; persistence is what separates them.
+        split_window: Sliding window the agreement is counted over.
+        split_cooldown_frames: Frames after reporting during which no new split
+            fires, so one fork is one event rather than a stream.
     """
 
     departure_threshold: float = 0.65
@@ -596,6 +608,12 @@ class LaneChangeConfig(_Strict):
     history_window: int = 60
     min_plausible_width_m: float = 2.2
     max_plausible_width_m: float = 5.0
+    detect_split: bool = True
+    split_min_ratio: float = 1.6
+    split_min_widening_m: float = 1.5
+    split_min_frames: int = 4
+    split_window: int = 8
+    split_cooldown_frames: int = 30
 
     @field_validator("departure_threshold", "recover_threshold", "cross_threshold")
     @classmethod
@@ -613,6 +631,17 @@ class LaneChangeConfig(_Strict):
         return v
 
     def model_post_init(self, _ctx: Any) -> None:
+        if self.split_min_frames > self.split_window:
+            raise ValueError(
+                f"split_min_frames ({self.split_min_frames}) exceeds "
+                f"split_window ({self.split_window}); the condition could never "
+                f"be met and splits would never be reported"
+            )
+        if self.split_min_ratio <= 1.0:
+            raise ValueError(
+                f"split_min_ratio must exceed 1.0 -- at or below it, parallel "
+                f"boundaries would count as diverging. Got {self.split_min_ratio}"
+            )
         if self.recover_threshold >= self.departure_threshold:
             raise ValueError(
                 f"recover_threshold ({self.recover_threshold}) must be below "

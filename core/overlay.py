@@ -29,6 +29,11 @@ _log = get_logger(__name__)
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
+#: Road splits are drawn in their own colour, deliberately unlike any lane role.
+#: A fork changes what the geometry means, so it must not read as one more
+#: boundary among the others.
+SPLIT_COLOR = (0, 200, 255)
+
 #: Per-class box colours (BGR). Unlisted classes fall back to LABEL_COLOR_DEFAULT.
 LABEL_COLORS: dict[str, tuple[int, int, int]] = {
     "vehicle": (0, 200, 255),
@@ -224,6 +229,47 @@ def draw_hud(
     for text in warnings:
         cv2.putText(vis, text, (pad + 10, y), FONT, cfg.font_scale, (60, 60, 255), 2, cv2.LINE_AA)
         y += row_h
+    return vis
+
+
+def draw_split(
+    image: np.ndarray,
+    split,
+    lanes: LaneSet,
+    camera: CameraModel,
+    cfg: OverlayConfig,
+) -> np.ndarray:
+    """Mark a detected road split: the gore nose and the diverging boundaries.
+
+    Drawn distinctly from the ordinary lane curves. A fork changes what the lane
+    geometry *means* -- across a gore the widening gap is not a wide lane -- so
+    it needs to read as a different kind of thing, not as another boundary.
+    """
+    if split is None:
+        return image
+    from models.lane_seg.fitting import fit_to_image_points
+
+    vis = image.copy()
+    diverging = {split.left_role, split.right_role}
+    for fit in lanes.all_fits():
+        if fit.role not in diverging:
+            continue
+        pts = fit_to_image_points(fit, camera)
+        if pts is None or len(pts) < 2:
+            continue
+        cv2.polylines(vis, [pts.reshape(-1, 1, 2).astype(np.int32)], False,
+                      SPLIT_COLOR, cfg.lane_thickness + 3, cv2.LINE_AA)
+
+    # A marker at the gore nose, where the road actually begins to divide.
+    ground = np.array([[0.0, split.gore_distance_m]])
+    px = np.asarray(camera.ground_to_image(ground)).reshape(-1, 2)
+    if len(px) and np.isfinite(px[0]).all():
+        x, y = int(round(px[0, 0])), int(round(px[0, 1]))
+        if 0 <= x < vis.shape[1] and 0 <= y < vis.shape[0]:
+            cv2.drawMarker(vis, (x, y), SPLIT_COLOR, cv2.MARKER_DIAMOND, 22, 3)
+            text = f"SPLIT {split.side.value} {split.gore_distance_m:.0f}m"
+            cv2.putText(vis, text, (x + 14, y), FONT, cfg.font_scale * 1.1,
+                        SPLIT_COLOR, 2, cv2.LINE_AA)
     return vis
 
 
