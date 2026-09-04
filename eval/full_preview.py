@@ -101,17 +101,38 @@ def main(argv: list[str] | None = None) -> int:
     # Calibration from the frames themselves. Without it there are no metres,
     # so no distance, no TTC and no lane geometry -- the overlay would fall back
     # to boxes alone, which is the very gap this script exists to close.
-    est = autocalib_estimate(frames[: min(8, len(frames))])
+    # Pooled calibration first: markings are dashed, so several frames of ONE
+    # clip give a far better vanishing point than any single frame.
+    pooled = autocalib_estimate(frames[: min(8, len(frames))])
     camera = None
-    if est is not None:
-        camera = CameraModel(H_image_to_ground=est.H_image_to_ground, image_size=(w, h))
-        print(f"auto-calibrated: horizon {est.horizon_v:.0f} px, "
-              f"pitch {np.rad2deg(est.pitch_rad):+.1f} deg")
+    if pooled is not None:
+        camera = CameraModel(H_image_to_ground=pooled.H_image_to_ground, image_size=(w, h))
+        print(f"auto-calibrated (pooled): horizon {pooled.horizon_v:.0f} px, "
+              f"pitch {np.rad2deg(pooled.pitch_rad):+.1f} deg")
     else:
-        print("! auto-calibration refused on these frames; "
-              "lane geometry and distance will be unavailable")
+        # Pooling fails when the frames come from DIFFERENT vehicles, which is
+        # normal for a content-selected sample: eight cameras averaged together
+        # have no common vanishing point, and refusing is correct. Fall back to
+        # calibrating each frame on its own, which is noisier but is the only
+        # thing that can be right when every frame has its own pose.
+        print("pooled auto-calibration refused (frames appear to be from "
+              "different cameras); falling back to per-frame calibration")
 
-    fitter = LaneFitter(camera, cfg.bev, cfg.lanes) if camera else None
+    per_frame_cameras: list[CameraModel | None] = []
+    for f in frames:
+        if camera is not None:
+            per_frame_cameras.append(camera)
+            continue
+        e = autocalib_estimate([f])
+        per_frame_cameras.append(
+            CameraModel(H_image_to_ground=e.H_image_to_ground, image_size=(w, h))
+            if e is not None else None)
+    if camera is None:
+        ok = sum(c is not None for c in per_frame_cameras)
+        print(f"  per-frame calibration succeeded on {ok}/{len(frames)} frames")
+
+    def _fitter_for(cam):
+        return LaneFitter(cam, cfg.bev, cfg.lanes) if cam is not None else None
     # On sampled stills a track can never reach n_init consecutive matches, so
     # every object stays unconfirmed and NOTHING gets a distance -- the tracker
     # silently suppresses the whole metric overlay. Confirming immediately is
@@ -122,12 +143,15 @@ def main(argv: list[str] | None = None) -> int:
         print("stills mode: tracks confirm immediately (ids are per-frame, "
               "distances are real)")
     tracker = ByteTracker(track_cfg)
-    collisions = CollisionEstimator(cfg.ttc, camera)
+    collisions = CollisionEstimator(cfg.ttc, camera)  # rebound per frame below
     engine = DecisionEngine(cfg.fusion)
     light_id = CLASS_IDS["traffic_light"]
 
     written: list[Path] = []
     for i, (path, frame) in enumerate(zip(frames_paths, frames)):
+        frame_camera = per_frame_cameras[i]
+        fitter = _fitter_for(frame_camera)
+        collisions.camera = frame_camera
         result = detector.infer(frame)
 
         # Lane mask from classical segmentation, folded into the FrameResult so
@@ -214,16 +238,16 @@ def main(argv: list[str] | None = None) -> int:
                     for a in decision.alerts]
 
         vis = annotate(
-            frame, result, lanes, camera or CameraModel(
+            frame, result, lanes, frame_camera or CameraModel(
                 H_image_to_ground=np.eye(3), image_size=(w, h)),
             cfg.overlay, hud, warnings,
             track_ids=track_ids, distances_m=distances,
             weather=None, road_condition=None,
         )
-        if camera is not None and objects:
-            vis = draw_distance_lines(vis, objects, camera, cfg.overlay)
-        if split is not None and camera is not None:
-            vis = draw_split(vis, split, lanes, camera, cfg.overlay)
+        if frame_camera is not None and objects:
+            vis = draw_distance_lines(vis, objects, frame_camera, cfg.overlay)
+        if split is not None and frame_camera is not None:
+            vis = draw_split(vis, split, lanes, frame_camera, cfg.overlay)
         dst = args.out / f"{i:03d}_{path.stem}.jpg"
         cv2.imwrite(str(dst), vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
         written.append(dst)
