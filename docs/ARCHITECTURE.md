@@ -178,6 +178,7 @@ to put boxes in confidently wrong places. No scalar distinguishes that from real
 progress; a frame does. So **every stage that produces predictions also writes
 what those predictions look like**, and the locations are fixed:
 
+| Full pipeline still | `outputs/full_previews/` | **Every** module composited: lanes, boxes, signals, track ids, alerts | `eval/full_preview.py` |
 | Stage | Written to | Contents | Controlled by |
 |---|---|---|---|
 | Training | `outputs/train_previews/<run>/epoch_<N>/` | A **fixed** validation sample, annotated, plus `epoch_<N>_sheet.jpg` | `--preview-every N`, `--preview-images` |
@@ -188,6 +189,17 @@ what those predictions look like**, and the locations are fixed:
 
 `eval/preview.py` holds those paths as module constants, so this table and the
 code cannot drift apart.
+
+**Two preview paths, deliberately.** `eval/preview.py` renders the detector
+alone, which is the right picture while a *detector* is training -- adding lanes
+and tracking would only obscure whether the boxes are improving.
+`eval/full_preview.py` renders the whole stack, which is the right picture of the
+*system*. Asking one script to do both produced the complaint that started this:
+previews that showed vehicles and nothing else.
+
+Full previews run frames **in order, as a sequence**, because three outputs do
+not exist for an isolated still: a track id needs a previous frame, a TTC needs a
+rate of change, and a lane-departure event needs a history.
 
 **The training sample is fixed, not resampled.** The entire value is flicking
 between `epoch_005/` and `epoch_030/` for the *same* image and seeing what
