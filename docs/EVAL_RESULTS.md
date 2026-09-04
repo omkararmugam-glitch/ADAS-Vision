@@ -73,7 +73,38 @@ Agreement with the teacher on held-out frames, as a distillation check:
 | yolov8n, distilled | 38 | **65.8%** |
 | yolov8m, teacher | 53 | 100% (reference) |
 
-### Data-scale ablation: 50 training images
+### Data-scale ablation: 50, 100 and 2,000 training images
+
+Same student, same teacher, same held-out 500-image val split. Only the training
+set size changes, so the comparison is clean.
+
+| | 50 images | 100 images | 2,000 images |
+|---|---|---|---|
+| Train boxes | 319 | 594 | ~11,400 |
+| mAP@0.5 | 0.0952 | **0.3819** | 0.6097 |
+| mAP@0.5:0.95 | 0.0628 | 0.2427 | 0.4095 |
+| Precision | 0.4574 | 0.4446 | 0.6306 |
+| Recall | 0.0419 | **0.3432** | 0.5852 |
+| vehicle | 0.381 | 0.838 | 0.910 |
+| person | 0.000 | 0.487 | 0.663 |
+| bicycle | 0.000 | 0.202 | 0.591 |
+| motorcycle | 0.000 | 0.001 | 0.275 |
+
+**Doubling 50 → 100 quadruples mAP**, and the 100-image model already reaches
+0.838 on vehicles — 92% of what 2,000 images achieve. Most of the headline gap
+between 100 and 2,000 is the *other* three classes.
+
+**The jump is not uniform, and that is the useful part.** Vehicle more than
+doubles while motorcycle stays at zero, because 100 images contain roughly two
+motorcycle boxes. Data scale helps the classes that already had examples and
+does nothing for the ones that still have none.
+
+**Precision barely moves (0.457 → 0.445) while recall rises eightfold.** The
+50-image model was not *imprecise*, it was *silent*: it emitted almost nothing,
+and the little it emitted was reasonable. A single mAP figure hides that
+completely; the previews show it at a glance, which is exactly why they exist.
+
+### Detail: the 50-image run
 
 Same student, same teacher, same held-out 500-image val split — only the training
 set size changed. This makes the comparison clean.
