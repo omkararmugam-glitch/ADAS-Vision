@@ -820,6 +820,77 @@ class WeatherConfig(_Strict):
         return v
 
 
+class PotholeConfig(_Strict):
+    """Road-hazard detection. In the cache key: it runs a network per frame.
+
+    Attributes:
+        enabled: Off until a model is trained.
+        mode: ``detector`` (YOLOv8 on pothole boxes) or ``classifier`` (binary
+            over road patches). Left configurable because the brief asks for
+            whichever gives better *precision* on the supplied data, and that is
+            a measurement, not a prior belief. See ``docs/EVAL_RESULTS.md`` s4.
+        weights: Trained checkpoint for the selected mode.
+        architecture: Backbone, classifier mode only.
+        conf_threshold: Deliberately high. Precision is weighted above recall:
+            a hazard warning that fires on every tar seam and manhole gets
+            ignored, and an ignored warning is worse than no warning because it
+            teaches the driver to dismiss the alerts that do matter.
+        input_size: Detector input size.
+        patch_px, patch_stride_px: Patch geometry, classifier mode only.
+        roi_top: Fraction of frame height above which patches are never sampled.
+            The road is in the lower frame; a classifier run over the whole image
+            calls dark windows potholes, having never been shown a non-road.
+        min_drivable_fraction: Share of a patch that must be drivable before it
+            is classified, when a drivable mask is available.
+        min_distance_m, max_distance_m: Hazards outside this band are dropped.
+            Too close to react to, or too far to be worth reporting.
+    """
+
+    enabled: bool = False
+    mode: str = "detector"
+    weights: Path = Path("models/pothole_det/weights/pothole.pt")
+    architecture: str = "resnet18"
+    conf_threshold: float = 0.55
+    input_size: int = 640
+    patch_px: int = 96
+    patch_stride_px: int = 64
+    roi_top: float = 0.5
+    min_drivable_fraction: float = 0.6
+    min_distance_m: float = 3.0
+    max_distance_m: float = 35.0
+
+    @field_validator("mode")
+    @classmethod
+    def _known_mode(cls, v: str) -> str:
+        if v not in {"detector", "classifier"}:
+            raise ValueError(
+                f"pothole.mode must be 'detector' or 'classifier', got '{v}'")
+        return v
+
+    @field_validator("conf_threshold", "roi_top", "min_drivable_fraction")
+    @classmethod
+    def _unit(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError(f"must be in [0, 1], got {v}")
+        return v
+
+    @field_validator("patch_px", "patch_stride_px", "input_size")
+    @classmethod
+    def _positive(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"must be >= 1, got {v}")
+        return v
+
+    def model_post_init(self, _ctx: Any) -> None:
+        if self.patch_stride_px > self.patch_px:
+            raise ValueError(
+                f"patch_stride_px ({self.patch_stride_px}) exceeds patch_px "
+                f"({self.patch_px}), which would leave gaps the sweep never looks at"
+            )
+        if self.min_distance_m >= self.max_distance_m:
+            raise ValueError("min_distance_m must be below max_distance_m")
+
+
 class Config(_Strict):
     """Root config. Sections are added as pipeline stages land."""
 
@@ -831,6 +902,7 @@ class Config(_Strict):
     lanes: LaneFitConfig = Field(default_factory=LaneFitConfig)
     depth: DepthConfig = Field(default_factory=DepthConfig)
     weather: WeatherConfig = Field(default_factory=WeatherConfig)
+    pothole: PotholeConfig = Field(default_factory=PotholeConfig)
     tracker: TrackerConfig = Field(default_factory=TrackerConfig)
     ttc: TTCConfig = Field(default_factory=TTCConfig)
     fusion: FusionConfig = Field(default_factory=FusionConfig)
@@ -844,7 +916,7 @@ class Config(_Strict):
     #: they run over cached detections in seconds; retuning an alert threshold
     #: must never re-run a network.
     CACHE_KEY_SECTIONS: ClassVar[tuple[str, ...]] = (
-        "io", "calibration", "bev", "detector", "lanes", "depth", "weather",
+        "io", "calibration", "bev", "detector", "lanes", "depth", "weather", "pothole",
     )
 
     def cache_key_payload(self) -> dict[str, Any]:

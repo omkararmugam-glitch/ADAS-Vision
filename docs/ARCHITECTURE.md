@@ -5,7 +5,9 @@
 | Stage | Capability | State |
 |---|---|---|
 | 1 | Repo scaffold, typed config, CLI | **done** |
-| 1 | Camera calibration (intrinsics + ground homography) | **done** — needs re-running, see below |
+| 1 | Camera calibration (intrinsics + ground homography) | **done** |
+| 1 | Target-free auto-calibration from road geometry | **done** |
+| 5 | Traffic light + sign detection, red-light warning | **done** |
 | 1 | Frame IO, canonical sizing, container timestamps | **done** |
 | 1 | Content-addressed run cache, `predict`/`render` split | **done** |
 | 2 | YOLOPv2 multi-task backbone (boxes + drivable + lane) | **done** |
@@ -14,13 +16,13 @@
 | 2 | Overlay + annotated video | **done** |
 | 3 | Dataset adapters | **BDD100K adapter done**, blocked on the label file |
 | 3 | YOLOv8 baseline | **working** on COCO-pretrained weights; not fine-tuned |
-| 3 | Weather classifier | blocked: needs BDD100K `attributes.weather` |
-| 3 | Pothole detector | blocked: no pothole dataset supplied |
+| 3 | Weather classifier | **code complete** — trainer + adapter written, awaiting labels |
+| 3 | Pothole detector | **code complete** — both approaches implemented, awaiting a dataset |
 | 4 | ByteTrack tracking | **done** |
 | 4 | MiDaS depth | **done** |
 | 4 | Lane-change detection, TTC | **done** |
 | 5 | Fusion / decision engine | **done** |
-| 7 | Evaluation scripts | **partial** — alert scoring done; mAP/mIoU need labels |
+| 7 | Evaluation scripts | **done** — detection mAP, alert scoring, FPS benchmark |
 | 8 | ONNX export + FPS benchmark | **done** |
 | 8 | Demo: HTML report + result gallery | **done** |
 

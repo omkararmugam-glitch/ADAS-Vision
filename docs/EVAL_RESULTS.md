@@ -155,7 +155,17 @@ different threshold adjustments and look similar at low resolution.
 ## 4. Pothole / road damage
 
 Detector **or** binary classifier — the choice gets made on these numbers, not in
-advance. See the open question in `ARCHITECTURE.md`.
+advance. **Both are implemented** (`models/pothole_det/`) behind one interface,
+sharing the same trainers as the vehicle detector and the weather classifier, so
+the comparison is like-for-like. Awaiting a road-damage dataset; BDD100K carries
+no such labels.
+
+The trade-off the numbers will settle:
+
+| | Localises | Label cost | Weakness |
+|---|---|---|---|
+| Detection | yes — enables the ego-corridor test | box labels | pothole boundaries are ill-defined, so annotator disagreement caps achievable IoU |
+| Patch classifier | no — grid cell only | image-level, far cheaper and more consistent | no position, so every hazard reads as equally relevant |
 
 | Approach | Dataset / split | Precision | Recall | mAP@0.5 | Notes |
 |---|---|---|---|---|---|
@@ -205,11 +215,35 @@ flat-ground assumption is violated badly enough to matter.
 Measured on the target machine: RTX 5050 Laptop (8 GB), fp16, 1280x720 input
 letterboxed to 640 long side.
 
+Measured on **real BDD100K frames**, which is the number that counts. The
+earlier figures in this table were taken on random-noise frames; noise yields
+almost no detections and therefore almost no NMS work, so it flattered the
+result. Both are kept so the difference is visible.
+
+| Configuration | Batch | FPS | ms/frame | Objects / 8 frames |
+|---|---|---|---|---|
+| YOLOv8n (COCO) | 1 | **145** | 6.89 | 19 |
+| YOLOv8n (COCO) | 8 | **363** | 2.76 | 19 |
+| YOLOv8m (COCO) | 1 | **92** | 10.84 | 31 |
+| YOLOv8m (COCO) | 8 | **171** | 5.83 | 31 |
+| YOLOv8n distilled | 1 | **146** | 6.86 | 19 |
+| YOLOv8n distilled | 8 | **369** | 2.71 | 19 |
+
+The distilled student is indistinguishable from stock `n` in speed — same
+architecture — while finding the same number of objects and agreeing more closely
+with the teacher. `m` costs about 1.6x the time for 63% more objects found.
+
+**YOLOPv2 is configured but its weights are absent**, so build step 6's
+multi-task-versus-baseline comparison is set up and cannot be run. Restoring
+`models/perception/weights/yolopv2.pt` completes it with no code change.
+
+Earlier noise-frame figures, retained for contrast:
+
 | Configuration | Batch | FPS | ms/frame | GPU mem | Notes |
 |---|---|---|---|---|---|
-| YOLOv8n (detection only) | 1 | **134** | 7.45 | 65 MiB | measured 2026-09-03 |
-| YOLOv8n (detection only) | 4 | **378** | 2.65 | 65 MiB | measured 2026-09-03 |
-| YOLOv8n (detection only) | 8 | **455** | 2.20 | 65 MiB | measured 2026-09-03 |
+| YOLOv8n (noise frames) | 1 | 134 | 7.45 | 65 MiB | optimistic |
+| YOLOv8n (noise frames) | 4 | 378 | 2.65 | 65 MiB | optimistic |
+| YOLOv8n (noise frames) | 8 | 455 | 2.20 | 65 MiB | optimistic |
 | YOLOPv2 only | — | — | — | — | — |
 | YOLOPv2 + VRU | — | — | — | — | — |
 | YOLOv8 baseline + lane model | — | — | — | — | — |
