@@ -14,12 +14,16 @@ ground-plane homography, with documented limits (see
 | ✅ | Lane detection (segmentation + geometric fit in metres) | working |
 | ✅ | Vehicle detection | working |
 | ✅ | Pedestrian / cyclist detection | working |
-| 🔧 | Lane-change detection | step 4 |
-| 🔧 | Collision detection / TTC | step 4 |
-| 🔧 | Traffic light & sign detection | step 3 |
-| 🔧 | Weather classification | step 3 |
-| 🔧 | Pothole / road damage | step 3 |
-| 🔧 | Fusion / alert engine | step 5 |
+| ✅ | Multi-object tracking (ByteTrack) | working |
+| ✅ | Lane departure & lane-change detection | working |
+| ✅ | Collision detection / time-to-collision | working |
+| ✅ | Fusion / alert engine (JSON + CSV logs) | working |
+| ✅ | Monocular depth (MiDaS), scale-aligned | working, off by default |
+| ⛔ | Traffic light & sign detection | needs BDD100K labels |
+| ⛔ | Weather classification | needs BDD100K labels |
+| ⛔ | Pothole / road damage | needs a pothole dataset |
+
+⛔ items are blocked on data, not on code. See [Datasets](#datasets).
 
 ## Setup
 
@@ -45,9 +49,18 @@ python run.py calibrate verify     --source drive.mp4
 # 2. Run perception. Fills a content-addressed cache; resumable.
 python run.py predict --source drive.mp4
 
-# 3. Render the annotated video from the cache. Loads no model.
+# 3. Tracks, TTC and alerts from the cache. Loads no model.
+python run.py analyse --source drive.mp4
+
+# 4. Render the annotated video from the cache. Loads no model.
 python run.py render --source drive.mp4 --out annotated.mp4
 ```
+
+`analyse` writes `alerts.json` (every frame plus an episode summary),
+`alerts.csv` (one row per alert) and `episodes.csv` beside the cache. It runs at
+roughly 4,000 frames/second, because tracking, TTC and fusion are excluded from
+the cache key — retuning an alert threshold re-derives every event across a clip
+in under a second.
 
 `predict` and `render` are separate on purpose — restyling the overlay or
 retuning a threshold never re-runs inference. `render` works with the weights
@@ -98,3 +111,64 @@ Two things need attention before the next stage — see
 - **Datasets are needed** to build the adapters. The expected format is specified
   in [DATASET_FORMAT.md](docs/DATASET_FORMAT.md), which ends with the open
   questions I need answered first.
+
+
+## Datasets
+
+The data layer is dataset-agnostic; see [DATASET_FORMAT.md](docs/DATASET_FORMAT.md)
+for the expected layout and `data/adapters/` for the converters.
+
+**BDD100K.** The adapter both converts *and* curates — 70,000 frames is far more
+than fine-tuning needs, and an unfiltered slice spends the budget on frames that
+teach nothing:
+
+```bash
+python data/adapters/bdd100k.py --labels path/to/det_train.json
+```
+
+Defaults select 12,000 images at 45% night, filtered by minimum box height.
+Night is deliberately over-represented because it is the measured weak case.
+
+> **Images alone are not enough.** BDD100K ships images and labels as separate
+> downloads. Without `det_train.json` there is nothing to train against and no
+> ground truth to score with — which is why several capabilities above are marked
+> blocked rather than merely unfinished.
+
+## Training and evaluation
+
+```bash
+# fine-tune a detector on any dataset in the documented layout
+python eval/train_detector.py --data data/processed/bdd100k/dataset.yaml
+
+# score alerts against labelled event intervals (reports LEAD TIME, not just P/R)
+python eval/score_alerts.py --predicted run/episodes.csv --truth events.csv
+
+# export to ONNX and benchmark — verifies both engines agree before quoting speed
+python eval/export_onnx.py --weights models/perception/weights/yolov8m.pt
+```
+
+Without ground truth, `eval/train_detector.py` can still run against pseudo-labels
+produced by a larger teacher (`data/adapters/pseudo_label.py`). That is genuine
+distillation and produces a genuine checkpoint — but **mAP against pseudo-labels
+measures agreement with the teacher, not correctness**, and the tooling says so
+in its own output rather than leaving it to be remembered.
+
+## Demo
+
+```bash
+python demo/test_dataset.py --n 120     # annotate a dataset sample + gallery
+python demo/build_report.py             # standalone HTML results report
+```
+
+Both write to `outputs/` and open with `file://` — no server, no framework, no CDN.
+
+## Tests
+
+```bash
+python -m pytest
+```
+
+412 tests. The ML models are not the interesting part to test; the geometry and
+the rules are. TTC is verified against analytically-known scenarios, the letterbox
+transform is round-trip tested, and every fusion rule is exercised with no video,
+no weights and no GPU.
