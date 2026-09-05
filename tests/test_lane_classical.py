@@ -109,3 +109,64 @@ class TestSegmenterInterface:
         fitter = LaneFitter(cam, BEVConfig(), LaneFitConfig())
         lanes = fitter.fit(ClassicalLaneSegmenter().infer(road()))
         assert lanes is not None and lanes.status is not None
+
+
+class TestOrientationFilter:
+    """Zebra crossings, stop lines and give-way markings run ACROSS the road.
+
+    They are white, thin, on tarmac and inside the road region, so every other
+    test here accepts them -- and the fitter then strings a crossing into a
+    "lane" cutting diagonally over the junction. Orientation is the only cue
+    that separates them.
+    """
+
+    def _base(self) -> np.ndarray:
+        img = np.full((H, W, 3), 70, np.uint8)
+        img[: int(0.42 * H)] = (170, 160, 150)
+        return img
+
+    def test_a_zebra_crossing_is_rejected(self) -> None:
+        img = self._base()
+        for y in range(430, 560, 22):          # horizontal bars across the road
+            cv2.rectangle(img, (300, y), (980, y + 11), (245, 245, 245), -1)
+        assert lane_mask(img).coverage < 0.005
+
+    def test_a_stop_line_is_rejected(self) -> None:
+        img = self._base()
+        cv2.rectangle(img, (280, 500), (1000, 516), (245, 245, 245), -1)
+        assert lane_mask(img).coverage < 0.005
+
+    def test_longitudinal_markings_survive(self) -> None:
+        """The filter must not also remove the markings it exists to keep."""
+        img = self._base()
+        cv2.line(img, (430, 620), (585, 330), (245, 245, 245), 8)
+        cv2.line(img, (860, 620), (700, 330), (245, 245, 245), 8)
+        assert lane_mask(img).mask.sum() > 0
+
+    def test_a_crossing_beside_real_markings_leaves_only_the_markings(self) -> None:
+        """Markings that stop short of the crossing, as they do on a real road."""
+        img = self._base()
+        for y in range(430, 540, 22):
+            cv2.rectangle(img, (300, y), (980, y + 11), (245, 245, 245), -1)
+        # Lane marking approaching the junction but ending before the crossing.
+        cv2.line(img, (430, 660), (500, 560), (245, 245, 245), 8)
+        out = lane_mask(img)
+        assert out.mask.sum() > 0, "the longitudinal marking must survive"
+        # Nothing from the crossing band itself should remain.
+        band = out.mask[430:552]
+        assert band.sum() == 0, "crossing bars must be removed"
+
+    def test_a_marking_touching_the_crossing_is_lost_with_it(self) -> None:
+        """A known limitation, pinned rather than hidden.
+
+        Connected-component analysis cannot separate structures that touch: a
+        marking running into a crossing merges with it, and the merged blob is
+        horizontal, so both are rejected. On real roads markings stop short of
+        the crossing, which is why this is acceptable -- but it is a real edge
+        case and the test records it so a future change is a deliberate one.
+        """
+        img = self._base()
+        for y in range(430, 540, 22):
+            cv2.rectangle(img, (300, y), (980, y + 11), (245, 245, 245), -1)
+        cv2.line(img, (430, 620), (585, 330), (245, 245, 245), 8)   # crosses the bars
+        assert lane_mask(img).mask.sum() == 0

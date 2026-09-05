@@ -22,6 +22,12 @@ is what distinguishes yellow paint from pale tarmac.
 x responds to exactly that and, unlike colour, keeps working when paint is grey
 with age. It also responds to every other vertical edge, which is why it is
 intersected with a road-region mask rather than used alone.
+
+**Orientation.** Lane markings run along the direction of travel. Zebra
+crossings, stop lines and give-way markings run across it, and are otherwise
+indistinguishable -- white, thin, on tarmac, inside the road region. Without an
+orientation test the fitter strings a crossing into a "lane" that cuts
+diagonally over the junction, which is what it did before this filter existed.
 """
 
 from __future__ import annotations
@@ -59,6 +65,29 @@ ROI_BOTTOM = 0.88
 #: A marking is a thin stripe. Anything wider than this fraction of the frame is
 #: a wall, a vehicle flank or a sunlit kerb, not paint.
 MAX_STRIPE_FRAC = 0.10
+
+#: Minimum angle from horizontal, in degrees, for a stripe to count as a lane
+#: marking. Lane markings run roughly along the direction of travel, so in the
+#: image they converge on the vanishing point and are far from horizontal.
+#:
+#: This exists because of ZEBRA CROSSINGS. Their stripes are white, thin, and
+#: pass every other test here -- but they run ACROSS the road, and the fitter
+#: happily strings them into a "lane" that cuts diagonally over the junction.
+#: Stop lines and give-way markings fail the same way. Orientation is the only
+#: cue that separates them from real markings.
+MIN_STRIPE_ANGLE_DEG = 25.0
+
+#: Maximum angle, in degrees, between a stripe's own direction and the direction
+#: from that stripe to the vanishing point.
+#:
+#: This is the cue that actually separates lane markings from zebra crossings,
+#: and the flat-angle test above is only a fallback for when no vanishing point
+#: is known. Under perspective a crossing's bars are NOT horizontal in the image
+#: -- they run diagonally, and steeply enough to pass any angle threshold loose
+#: enough to keep real markings near the horizon. What remains true is that a
+#: lane marking lies along the direction of travel and therefore points AT the
+#: vanishing point, while a crossing bar lies across it and points well away.
+MAX_VP_MISALIGNMENT_DEG = 22.0
 
 
 @dataclass(frozen=True)
@@ -113,8 +142,15 @@ def lane_mask(
     white_lightness: int = WHITE_LIGHTNESS,
     yellow_saturation: int = YELLOW_SATURATION,
     gradient_threshold: int = GRADIENT_THRESHOLD,
+    vanishing_point: tuple[float, float] | None = None,
 ) -> LaneMaskResult:
     """Segment lane markings in one BGR frame.
+
+    Args:
+        vanishing_point: ``(u, v)`` in pixels, when known. Supplying it replaces
+            the crude flat-angle test with the correct one -- a lane marking
+            points at the vanishing point, a zebra crossing does not -- and is
+            the difference between rejecting a crossing and painting it as lane.
 
     Returns:
         A :class:`LaneMaskResult`. The mask is directly consumable by
@@ -163,9 +199,31 @@ def lane_mask(
         pts = cv2.findNonZero((labels == i).astype(np.uint8))
         if pts is None:
             continue
-        (_, _), (rw, rh), _ = cv2.minAreaRect(pts)
-        if min(rw, rh) <= max_width:
-            keep[labels == i] = 255
+        (_, _), (rw, rh), angle = cv2.minAreaRect(pts)
+        if min(rw, rh) > max_width:
+            continue
+        # Angle of the LONG axis, measured from horizontal. OpenCV reports the
+        # rectangle angle in (-90, 0]; which side is "long" depends on whether
+        # width or height is larger, so both cases are handled explicitly rather
+        # than assumed.
+        long_axis_angle = angle if rw >= rh else angle + 90.0
+
+        if vanishing_point is not None:
+            # Does this stripe point at the vanishing point? Compare its own
+            # direction with the direction from its centroid to the VP. Both are
+            # undirected lines, so the comparison folds to 0-90 degrees.
+            cy_, cx_ = (stats[i, cv2.CC_STAT_TOP] + stats[i, cv2.CC_STAT_HEIGHT] / 2,
+                        stats[i, cv2.CC_STAT_LEFT] + stats[i, cv2.CC_STAT_WIDTH] / 2)
+            to_vp = np.degrees(np.arctan2(vanishing_point[1] - cy_,
+                                          vanishing_point[0] - cx_))
+            delta = abs(((long_axis_angle - to_vp + 90.0) % 180.0) - 90.0)
+            if delta > MAX_VP_MISALIGNMENT_DEG:
+                continue    # lies across the road, not along it
+        else:
+            from_horizontal = abs(((long_axis_angle + 90.0) % 180.0) - 90.0)
+            if from_horizontal < MIN_STRIPE_ANGLE_DEG:
+                continue    # fallback: obviously transverse
+        keep[labels == i] = 255
 
     roi_area = int(roi.sum())
     coverage = float((keep > 0).sum()) / max(1, roi_area)
@@ -187,7 +245,9 @@ class ClassicalLaneSegmenter:
         white_lightness: int = WHITE_LIGHTNESS,
         yellow_saturation: int = YELLOW_SATURATION,
         gradient_threshold: int = GRADIENT_THRESHOLD,
+        vanishing_point: tuple[float, float] | None = None,
     ) -> None:
+        self.vanishing_point = vanishing_point
         self.roi_top = roi_top
         self.roi_bottom = roi_bottom
         self.white_lightness = white_lightness
@@ -203,6 +263,7 @@ class ClassicalLaneSegmenter:
         return lane_mask(
             frame, self.roi_top, self.roi_bottom, self.white_lightness,
             self.yellow_saturation, self.gradient_threshold,
+            self.vanishing_point,
         ).mask
 
     def infer_detailed(self, frame: np.ndarray) -> LaneMaskResult:
@@ -210,4 +271,5 @@ class ClassicalLaneSegmenter:
         return lane_mask(
             frame, self.roi_top, self.roi_bottom, self.white_lightness,
             self.yellow_saturation, self.gradient_threshold,
+            self.vanishing_point,
         )

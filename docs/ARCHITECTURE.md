@@ -299,6 +299,42 @@ figures are for exact synthetic boxes on perfectly flat ground — they validate
 the *geometry*, and say nothing about real-world accuracy, which is dominated by
 the error sources tabulated above.
 
+## Panelled previews
+
+`eval/panel_preview.py` renders each module into its own titled panel — input,
+lane pixels, lane fit, detections, distance/tracking, road split, then the
+composite — rather than stacking every overlay on one frame.
+
+The composite proves the modules run together, but on a busy junction it is
+unreadable: boxes, lane curves, distance lines, the gore marker and the HUD all
+overlap, and a *wrong* lane fit is indistinguishable from a right one under the
+clutter. Each panel carrying only its own ink makes a bad lane fit obvious **as a
+bad lane fit**. The composite is kept as the final panel, because the modules do
+genuinely interact.
+
+### Known weakness: pedestrian crossings
+
+The classical segmenter takes zebra crossings as lane markings at junctions.
+Three filters were tried:
+
+1. **Thinness** (`minAreaRect` minor axis) — crossing bars are thin too, so it
+   passes them.
+2. **Flat-angle rejection** — under perspective a crossing's bars are not
+   horizontal in the image; they run diagonally, steeply enough to survive any
+   threshold loose enough to keep genuine markings near the horizon.
+3. **Vanishing-point alignment** — correct in principle, and it does reject
+   isolated transverse stripes. It fails here for a specific reason: adjacent
+   crossing bars **merge into one connected component**, and the merged diagonal
+   chain points along the road, so it aligns with the vanishing point and is
+   kept. Measured deltas on a real junction were 1.6–10.9°, well inside the
+   22° gate.
+
+The filters are retained because each rejects real cases, but none solves this
+one. The promising route is the **learned segmenter**
+(`models/lane_seg/segmenter.py`), which has the spatial context a per-pixel rule
+lacks and can learn that a crossing is not a lane — something no threshold on an
+individual component can express.
+
 ## Road splits — forks, exit ramps, dividing carriageways
 
 The lane fitter assumes one continuous road with roughly parallel boundaries.
