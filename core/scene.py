@@ -53,6 +53,10 @@ LEFT_BOUNDARY = (80, 225, 80)
 RIGHT_BOUNDARY = (60, 60, 240)
 PATH_DASH = (245, 180, 70)
 FORBIDDEN_FILL = (70, 70, 225)
+#: Orange: a same-direction lane with nothing in it -- a lane change is
+#: available. Deliberately between the green of "yours" and the red of "not
+#: yours", because that is exactly what it is: not yours, but you may take it.
+CHANGE_FILL = (40, 165, 255)
 PANEL_BG = (22, 22, 22)
 PANEL_FG = (245, 245, 245)
 ACCENT = (60, 220, 250)
@@ -72,6 +76,14 @@ MAX_LATERAL_M = 9.0
 #: The opposing carriageway of a divided road is different and does run to the
 #: edge: there the claim really is "everything past this line is theirs".
 BRANCH_WIDTH_M = 3.6
+
+#: Furthest the corridor is ever drawn, in metres.
+MAX_RENDER_M = 110.0
+
+#: Drawing stops this many pixels short of the vanishing line. Exactly on it the
+#: projection is singular and a metre of road maps to no pixels at all; close to
+#: it, a centimetre of lateral error maps to a visible swing.
+HORIZON_MARGIN_PX = 22.0
 
 
 @dataclass
@@ -120,6 +132,78 @@ def trusted_range(lanes: LaneSet, style: SceneStyle | None = None
     return (lo, hi) if hi - lo > 0.5 else None
 
 
+def corridor_range(lanes: LaneSet, camera: CameraModel) -> tuple[float, float] | None:
+    """The trusted range, carried onward to where the road actually ends.
+
+    ``trusted_range`` says how far the *pixels* reach. This says how far the
+    *road* reaches, which is what a lane overlay should cover: a boundary drawn
+    only as far as its paint survived leaves a stub floating in the middle of
+    the image, and the road plainly continues past it.
+    """
+    rng = trusted_range(lanes)
+    if rng is None:
+        return None
+    lo, hi = rng
+    width = lanes.lane_width_m
+    far = min(
+        far_limit(lanes.ego_left, camera, width, lanes.ego_right),
+        far_limit(lanes.ego_right, camera, width, lanes.ego_left),
+    )
+    return (lo, max(hi, far))
+
+
+def far_limit(fit: LaneFit, camera: CameraModel, width_ref: float | None = None,
+              partner: LaneFit | None = None) -> float:
+    """How far out this boundary may be drawn before it stops meaning anything.
+
+    Walks outward from the fitted range and stops at the first of:
+
+    * the **vertex of the parabola**, where ``dx/dy`` changes sign. Past it the
+      fitted curve turns back on itself, which produced a visible hook at the
+      top of every long boundary. No road does that, so the vertex is not a
+      threshold to be tuned -- it is the exact point beyond which the model has
+      stopped describing a road at all;
+    * the projected point reaching the horizon -- there is no more road to draw;
+    * the curve passing ``MAX_LATERAL_M``, which is the quadratic diverging
+      rather than the road bending;
+    * the corridor width departing from the measured width by more than half,
+      which is the pair fanning open. Under the parallel model width is constant
+      by construction so this never fires, which is the point: a jointly-fitted
+      pair earns the long reach and an independently-fitted one has to prove it
+      metre by metre.
+
+    This is what makes the drawn lane run from the car to the end of the road
+    instead of stopping wherever the paint happened to run out.
+    """
+    lo, hi = fit.y_range_m
+    limit = hi
+
+    # The parabola's turning point, if it lies ahead of the fitted range.
+    a, b, _ = fit.coeffs
+    ceiling = MAX_RENDER_M
+    if abs(a) > 1e-9:
+        vertex = -b / (2.0 * a)
+        if vertex > hi:
+            ceiling = min(ceiling, vertex)
+
+    for y in np.arange(hi, ceiling, 1.0):
+        x = float(fit.x_at(float(y))[0])
+        if abs(x) > MAX_LATERAL_M:
+            break
+        pt = np.asarray(camera.ground_to_image(np.array([[x, float(y)]]))).reshape(-1)
+        if not np.all(np.isfinite(pt)):
+            break
+        v_h = float(np.asarray(camera.horizon_v(float(pt[0]))).reshape(-1)[0])
+        if np.isfinite(v_h) and pt[1] - v_h < HORIZON_MARGIN_PX:
+            break
+        if partner is not None and width_ref:
+            w = abs(float(partner.x_at(float(y))[0]) - x)
+            if abs(w - width_ref) > 0.5 * width_ref:
+                break
+        limit = float(y)
+    return max(limit, hi)
+
+
 def _project(fit: LaneFit, camera: CameraModel, rng: tuple[float, float],
              n: int) -> np.ndarray:
     """Project a fitted boundary, dropping samples the model cannot support.
@@ -152,7 +236,9 @@ def _project(fit: LaneFit, camera: CameraModel, rng: tuple[float, float],
 #: The bonnet continuation may cover at most this fraction of the frame height.
 #: A fit whose near end is already high in the image starts far away, and
 #: continuing it all the way down would invent more road than it measured.
-MAX_BOTTOM_EXTENSION_FRAC = 0.28
+#: Generous, because the continuation is a straight segment in image space and
+#: cannot diverge: the cap guards against absurdity, not against error.
+MAX_BOTTOM_EXTENSION_FRAC = 0.46
 
 
 def _extend_to_bottom(pts: np.ndarray, height: int) -> np.ndarray:
@@ -201,7 +287,7 @@ def draw_drivable_area(
 ) -> np.ndarray:
     """Fill the ego corridor between the two boundaries."""
     style = style or SceneStyle()
-    rng = trusted_range(lanes, style)
+    rng = corridor_range(lanes, camera)
     if rng is None:
         return image
     lp = _project(lanes.ego_left, camera, rng, style.samples)
@@ -228,27 +314,26 @@ def draw_boundaries(
     """
     style = style or SceneStyle()
     vis = image.copy()
-    for fit, colour in ((lanes.ego_left, LEFT_BOUNDARY),
-                        (lanes.ego_right, RIGHT_BOUNDARY)):
+    rng = corridor_range(lanes, camera)
+    for fit, partner, colour in ((lanes.ego_left, lanes.ego_right, LEFT_BOUNDARY),
+                                 (lanes.ego_right, lanes.ego_left, RIGHT_BOUNDARY)):
         if fit is None:
             continue
-        lo, hi = fit.y_range_m
+        if rng is not None:
+            lo, hi = rng
+        else:
+            lo, hi = fit.y_range_m
+            hi = far_limit(fit, camera, lanes.lane_width_m, partner)
         pts = _project(fit, camera, (lo, hi), style.samples)
-        if len(pts) >= 2:
-            pts = _extend_to_bottom(pts, vis.shape[0])
-            cv2.polylines(vis, [pts.reshape(-1, 1, 2).astype(np.int32)], False,
-                          colour, style.boundary_thickness, cv2.LINE_AA)
-        if not lanes.parallel_model:
+        if len(pts) < 2:
             continue
-        for a, b in ((max(0.5, lo - style.extend_near_m), lo),
-                     (hi, hi + style.extend_far_m)):
-            if b <= a:
-                continue
-            ext = _project(fit, camera, (a, b), max(24, style.samples // 5))
-            if len(ext) >= 2:
-                cv2.polylines(vis, [ext.reshape(-1, 1, 2).astype(np.int32)],
-                              False, colour,
-                              max(2, style.boundary_thickness // 2), cv2.LINE_AA)
+        # One polyline, bonnet to horizon. Drawn as a single stroke rather than
+        # a measured part plus an extension: a line broken into pieces of
+        # different weight reads as two separate detections, and the road it
+        # describes is continuous.
+        pts = _extend_to_bottom(pts, vis.shape[0])
+        cv2.polylines(vis, [pts.reshape(-1, 1, 2).astype(np.int32)], False,
+                      colour, style.boundary_thickness, cv2.LINE_AA)
     return vis
 
 
@@ -262,7 +347,7 @@ def draw_predicted_path(
     with distance like real paint instead of marching evenly up the screen.
     """
     style = style or SceneStyle()
-    rng = trusted_range(lanes, style)
+    rng = corridor_range(lanes, camera)
     if rng is None or lanes.ego_left is None or lanes.ego_right is None:
         return image
     centre = LaneFit(
@@ -355,6 +440,47 @@ def _forbidden_wedge(
     return vis
 
 
+def draw_lane_options(
+    image: np.ndarray, road_lanes, camera: CameraModel,
+    style: SceneStyle | None = None, label: bool = True,
+) -> np.ndarray:
+    """Tint the free same-direction lanes orange: a change is available there.
+
+    Only ``LaneKind.FREE`` is painted. An occupied neighbour is left alone
+    rather than given a colour of its own -- the absence of orange already says
+    "not available", and a fourth region colour would dilute the three that
+    carry meaning.
+    """
+    from models.lane_seg.neighbours import LaneKind
+
+    style = style or SceneStyle()
+    vis = image
+    for lane in road_lanes or ():
+        if lane.kind is not LaneKind.FREE:
+            continue
+        lo, hi = lane.y_range_m
+        hi = far_limit(lane.left, camera, lane.width_m, lane.right)
+        lp = _project(lane.left, camera, (lo, hi), style.samples)
+        rp = _project(lane.right, camera, (lo, hi), style.samples)
+        if len(lp) < 2 or len(rp) < 2:
+            continue
+        lp, rp = _extend_pair_to_bottom(lp, rp, vis.shape[0])
+        vis = vis.copy()
+        overlay = vis.copy()
+        cv2.fillPoly(overlay, [np.vstack([lp, rp[::-1]]).astype(np.int32)],
+                     CHANGE_FILL)
+        cv2.addWeighted(overlay, style.fill_alpha, vis, 1 - style.fill_alpha, 0, vis)
+        if label:
+            y_tag = lo + 0.3 * (hi - lo)
+            pt = camera.ground_to_image(
+                np.array([[lane.centre_x_at(y_tag), y_tag]]))[0]
+            if np.all(np.isfinite(pt)):
+                arrow = "<-" if lane.side == "left" else "->"
+                _tag(vis, f"{arrow} Lane change {lane.side}",
+                     (int(pt[0]), int(pt[1])), CHANGE_FILL, style.label_scale)
+    return vis
+
+
 def draw_branch(
     image: np.ndarray, split, lanes: LaneSet, camera: CameraModel,
     style: SceneStyle | None = None,
@@ -431,6 +557,7 @@ def draw_legend(image: np.ndarray, style: SceneStyle | None = None) -> np.ndarra
         (LEFT_BOUNDARY, "Left lane boundary", False),
         (RIGHT_BOUNDARY, "Right lane boundary", False),
         (PATH_DASH, "Lane centre (predicted path)", True),
+        (CHANGE_FILL, "Lane change available", False),
         (FORBIDDEN_FILL, "Do not enter (exit / oncoming)", False),
     ]
     vis = image.copy()
@@ -552,6 +679,7 @@ def draw_scene(
     *,
     split=None,
     carriageway=None,
+    road_lanes=None,
     status_rows: list[tuple[str, str]] | None = None,
     style: SceneStyle | None = None,
     show_panel: bool = True,
@@ -570,6 +698,10 @@ def draw_scene(
     vis = image
     if camera is not None and lanes.status is not LaneStatus.NOT_DETECTED:
         vis = draw_drivable_area(vis, lanes, camera, style)
+        # Options before prohibitions: where the two overlap -- a free lane the
+        # carriageway logic then rules oncoming -- red must win, and painting it
+        # second is what makes it win.
+        vis = draw_lane_options(vis, road_lanes, camera, style)
         vis = draw_branch(vis, split, lanes, camera, style)
         if split is None:
             # A fork and a divided road are different claims; showing both
@@ -591,7 +723,7 @@ def draw_scene(
 def scene_status_rows(
     lanes: LaneSet, split=None, carriageway=None,
     weather: str | None = None, visibility: str | None = None,
-    speed_kmh: float | None = None,
+    speed_kmh: float | None = None, road_lanes=None,
 ) -> list[tuple[str, str]]:
     """Rows for the perception panel, skipping anything not actually known.
 
@@ -611,6 +743,12 @@ def scene_status_rows(
         rows.append(("Road", f"split ahead ({side})"))
     elif carriageway is not None:
         rows.append(("Road", f"divided, oncoming {carriageway.divider_side}"))
+    if road_lanes:
+        from models.lane_seg.neighbours import change_options
+
+        opts = change_options(road_lanes)
+        rows.append(("Lane change",
+                     ", ".join(sorted({o.side for o in opts})) if opts else "none"))
     if lanes.lane_width_m is not None:
         rows.append(("Lane width", f"{lanes.lane_width_m:.2f} m"))
     if lanes.curvature_radius_m is not None:

@@ -189,17 +189,18 @@ what those predictions look like**, and the locations are fixed:
 | Dataset spot-check | `outputs/tested*/` + `index.html` | Per-frame annotations, filterable gallery | `demo/test_dataset.py` |
 | Model comparison | `outputs/compare*/` | Same frame through several checkpoints | `eval/compare_detectors.py` |
 
-The nine sections, in the order the index lists them:
+The ten sections, in the order the index lists them:
 
     01_lane_detection/    lane pixels and the fitted boundaries, nothing else
     02_lane_split/        a fork or exit ramp opening up ahead
     03_divided_highway/   a road already split into opposing directions
-    04_vehicles/          vehicle boxes only
-    05_pedestrians/       people, cyclists, motorcyclists only
-    06_traffic_control/   lights with the colour read from their pixels, and signs
-    07_distance_ttc/      distance lines from the ego to each object
-    08_tracking/          persistent track ids
-    09_full_pipeline/     everything composited, as the pipeline really outputs it
+    04_lane_change/       neighbouring lanes that are free to move into
+    05_vehicles/          vehicle boxes only
+    06_pedestrians/       people, cyclists, motorcyclists only
+    07_traffic_control/   lights with the colour read from their pixels, and signs
+    08_distance_ttc/      distance lines from the ego to each object
+    09_tracking/          persistent track ids
+    10_full_pipeline/     everything composited, as the pipeline really outputs it
 
 `build_sections.py` deletes section folders no longer listed in `SECTIONS`, so a
 renumbering cannot leave stale ones behind for the index to disagree with.
@@ -362,7 +363,11 @@ the same fact always looks the same whichever script rendered the frame.
 |---|---|
 | **Green** | your side: the ego corridor and its left boundary |
 | **Red** | do not enter: the right boundary, an exit branch, the oncoming carriageway |
+| **Orange** | a free neighbouring lane: a lane change is available |
 | **Blue, dashed** | the predicted path down the lane centre — a *path*, deliberately not an edge |
+
+Orange sits between the green of "yours" and the red of "not yours" because
+that is exactly what it is: not yours, but you may take it.
 
 Red carries two apparent meanings — "edge of your lane" and "region that is not
 yours" — but one idea: crossing it is the thing not to do. That is worth more
@@ -412,10 +417,65 @@ far away, and continuing it would invent more road than it measured.
 `MAX_LATERAL_M` (9 m), so a curve that leaves the road *stops* instead of
 carrying on confidently across scenery.
 
-**4. The two corridor edges were extended separately** and could cross before
+**4. Curves ran past the parabola's vertex.** Every long boundary ended in a
+visible hook where the fitted quadratic turned back on itself. `far_limit` now
+stops at the vertex, where `dx/dy` changes sign. That is not a threshold to
+tune — no road reverses direction, so the vertex is the exact point beyond
+which the model has stopped describing a road at all.
+
+**5. The two corridor edges were extended separately** and could cross before
 reaching the bonnet, filling a bowtie. `_extend_pair_to_bottom` drops the
 extension for both when that would happen: a corridor stopping a few metres
 short is a smaller lie than one folding through itself.
+
+### Lane-change options
+
+`models/lane_seg/neighbours.py`. The fitter says where the boundaries are;
+`enumerate_lanes` answers the question a driver actually has — **which of these
+lanes could I move into.** Every adjacent pair of boundaries is a candidate
+lane, filtered on plausible and roughly constant width (a gap that opens is a
+gore; one six metres wide is a median), then classified:
+
+| | |
+|---|---|
+| `EGO` | the lane being driven |
+| `FREE` | same direction, nothing in it — **orange**, a change is available |
+| `OCCUPIED` | same direction, but a vehicle is in it |
+| `ONCOMING` | beyond the divider of a divided road; never an option |
+| `BRANCH` | the exit lane of a fork; an option, but a different journey |
+
+`FREE` versus `ONCOMING` is the distinction that carries the weight, because
+geometrically they are identical — an empty strip of road alongside. Only
+`carriageway.py` can separate them, so this consumes its answer rather than
+guessing. Inviting a lane change into head-on traffic is the worst output this
+system could produce, so classification is ordered most-restrictive-first and
+oncoming always beats free.
+
+Occupancy is decided at the **ground contact point**, the bottom edge of the
+box — the only part of a 2-D detection actually on the road plane. A box centre
+floats at bumper height and back-projects well beyond the vehicle, which on a
+three-lane road puts a lorry in the wrong lane.
+
+Three bugs here were found by rendering frames and looking at them, and each is
+now a test:
+
+* **The lane was painted to the horizon but checked for occupants only over the
+  few metres its paint survived** — orange laid across three visible cars.
+* **The same at the near end.** A fit starting at 5.6 m ignored a car at 4.3 m:
+  directly alongside, and the single most important vehicle in the frame for a
+  lane change.
+* **A traffic light's box back-projected to the road**, putting a phantom
+  vehicle in whichever lane the gantry crossed. Occupants are now filtered to
+  `ROAD_USER_CLASSES`.
+
+Occupancy is therefore checked over a *wider* range than the boundaries were
+fitted, extrapolating them to do it. Acceptable in this direction only: a
+wrongly-included vehicle downgrades a lane to occupied, and being conservative
+about an invitation costs nothing.
+
+What it does not do is decide whether a change is **safe**. Free means
+unoccupied *ahead*. There is nothing behind — a vehicle closing from the rear is
+invisible to a forward camera, and no geometry here can supply it.
 
 ### Regions
 
