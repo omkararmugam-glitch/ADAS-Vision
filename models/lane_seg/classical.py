@@ -101,12 +101,18 @@ class LaneMaskResult:
             means the thresholds have latched onto something that is not paint.
         from_colour: Pixels contributed by the colour cue.
         from_gradient: Pixels contributed by the gradient cue.
+        yellow_mask: The surviving markings that were YELLOW. Kept separate
+            because in US road marking -- which is what BDD100K shows -- yellow
+            separates opposing directions of travel while white separates lanes
+            going the same way. That distinction is not cosmetic: it is the
+            difference between the next lane over and oncoming traffic.
     """
 
     mask: np.ndarray
     coverage: float
     from_colour: int
     from_gradient: int
+    yellow_mask: np.ndarray | None = None
 
     @property
     def is_plausible(self) -> bool:
@@ -227,11 +233,24 @@ def lane_mask(
 
     roi_area = int(roi.sum())
     coverage = float((keep > 0).sum()) / max(1, roi_area)
+    # Which of the surviving components were yellow? Decided per component by
+    # majority, not per pixel: a marking's colour is a property of the marking,
+    # and a few desaturated pixels along a worn edge should not split one line
+    # into two differently-coloured fragments.
+    yellow_keep = np.zeros_like(keep)
+    if keep.any():
+        yn, ylabels, _, _ = cv2.connectedComponentsWithStats(keep, connectivity=8)
+        for j in range(1, yn):
+            comp = ylabels == j
+            if comp.sum() and (yellow & comp).sum() > 0.4 * comp.sum():
+                yellow_keep[comp] = 255
+
     return LaneMaskResult(
         mask=keep,
         coverage=coverage,
         from_colour=int((colour & roi).sum()),
         from_gradient=int((gradient & roi).sum()),
+        yellow_mask=yellow_keep,
     )
 
 

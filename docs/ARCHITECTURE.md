@@ -178,14 +178,31 @@ to put boxes in confidently wrong places. No scalar distinguishes that from real
 progress; a frame does. So **every stage that produces predictions also writes
 what those predictions look like**, and the locations are fixed:
 
-| Full pipeline still | `outputs/full_previews/` | **Every** module composited: lanes, boxes, signals, track ids, alerts | `eval/full_preview.py` |
 | Stage | Written to | Contents | Controlled by |
 |---|---|---|---|
 | Training | `outputs/train_previews/<run>/epoch_<N>/` | A **fixed** validation sample, annotated, plus `epoch_<N>_sheet.jpg` | `--preview-every N`, `--preview-images` |
 | Evaluation | `outputs/eval_previews/<run>/` | Validation split (evenly sampled if large) + `contact_sheet.jpg` | automatic after training |
+| Full pipeline still | `outputs/full_previews/` | **Every** module composited: lanes, boxes, signals, track ids, alerts | `eval/full_preview.py` |
+| One module per panel | `outputs/panels/` | The same frame as a grid, one module per titled panel | `eval/panel_preview.py` |
+| Per-capability sections | `outputs/sections/<NN>_<name>/` + `index.html` | One folder per capability, each showing only that capability | `demo/build_sections.py` |
 | Demo pipeline | `outputs/demo/<source>_annotated.mp4` | Every module composited on one frame | `run.py render` |
 | Dataset spot-check | `outputs/tested*/` + `index.html` | Per-frame annotations, filterable gallery | `demo/test_dataset.py` |
 | Model comparison | `outputs/compare*/` | Same frame through several checkpoints | `eval/compare_detectors.py` |
+
+The nine sections, in the order the index lists them:
+
+    01_lane_detection/    lane pixels and the fitted boundaries, nothing else
+    02_lane_split/        a fork or exit ramp opening up ahead
+    03_divided_highway/   a road already split into opposing directions
+    04_vehicles/          vehicle boxes only
+    05_pedestrians/       people, cyclists, motorcyclists only
+    06_traffic_control/   lights with the colour read from their pixels, and signs
+    07_distance_ttc/      distance lines from the ego to each object
+    08_tracking/          persistent track ids
+    09_full_pipeline/     everything composited, as the pipeline really outputs it
+
+`build_sections.py` deletes section folders no longer listed in `SECTIONS`, so a
+renumbering cannot leave stale ones behind for the index to disagree with.
 
 `eval/preview.py` holds those paths as module constants, so this table and the
 code cannot drift apart.
@@ -302,8 +319,8 @@ the error sources tabulated above.
 ## Panelled previews
 
 `eval/panel_preview.py` renders each module into its own titled panel — input,
-lane pixels, lane fit, detections, distance/tracking, road split, then the
-composite — rather than stacking every overlay on one frame.
+lane pixels, lane fit, detections, distance/tracking, road split ahead, divided
+highway, then the composite — rather than stacking every overlay on one frame.
 
 The composite proves the modules run together, but on a busy junction it is
 unreadable: boxes, lane curves, distance lines, the gore marker and the HUD all
@@ -335,7 +352,7 @@ one. The promising route is the **learned segmenter**
 lacks and can learn that a crossing is not a lane — something no threshold on an
 individual component can express.
 
-## Road splits — forks, exit ramps, dividing carriageways
+## Road splits — forks and exit ramps ahead
 
 The lane fitter assumes one continuous road with roughly parallel boundaries.
 Where the road actually divides, that assumption fails **silently and in the
@@ -367,6 +384,81 @@ Two deliberate limits:
 Rendered in its own colour, distinct from every lane role, with a marker at the
 gore nose. A fork changes what the lane geometry *means*, so it must not read as
 one more boundary among the others.
+
+## Divided roads — the two directions of travel
+
+`models/lane_seg/carriageway.py`. Adjacent to road splits and answering a
+different question, which is worth stating plainly because the two get confused:
+
+* **Road split** (`split.py`) — the road is *about to divide*. A fork, an exit
+  ramp. The gap between two boundaries **opens** with distance. An event the
+  driver is approaching.
+* **Divided road** (`carriageway.py`) — the road is *already divided*, one
+  carriageway each way. The gap **stays constant**. A standing property of the
+  road, true for miles.
+
+The distinction drives behaviour, not taxonomy. Everything beyond the divider is
+**oncoming traffic**: closing at the sum of both speeds, never a lane the ego may
+change into, and liable to leave frame fast. Reading a divided road as one wide
+road gets all three wrong.
+
+### Two cues
+
+**Yellow paint.** Under the US marking standard — which is what BDD100K shows —
+yellow separates *opposing directions* and white separates *same-direction*
+lanes. A yellow boundary is therefore the direction divider by definition, not by
+inference. `models/lane_seg/classical.py` already thresholded yellow separately
+and then merged it away with `colour = white | yellow`; `LaneMaskResult` now
+carries `yellow_mask` alongside the merged one. Colour is assigned **per
+connected component by majority**, not per pixel, because a marking's colour is a
+property of the marking and a few desaturated pixels along a worn edge should not
+split one line into two differently-coloured fragments.
+
+**A median gap.** Two boundaries ≥ 5 m apart whose separation holds constant are
+not one very wide lane; they are the inner edges of two carriageways. Constancy
+is what separates this from a fork — and it is why `detect_split` skips pairs
+already that far apart. The two detectors partition the cases rather than
+overlapping, which `TestDistinctFromFork` pins down in both directions.
+
+### What the real frames forced
+
+Measured on 300 random BDD100K frames (129 auto-calibrate, 123 get a lane fit).
+A first version fired on **33** of those 123, and rendering them showed most were
+wrong. Three fixes, each aimed at an observed failure rather than guessed at:
+
+| Failure seen | Fix | Why it is not a hack |
+|---|---|---|
+| Yellow **kerb/edge lines** on the ego's right read as dividers | `drive_side` **gates** the yellow cue instead of discounting it | Under the same standard that makes yellow meaningful, a yellow line to the driver's right marks the roadway edge. Accepting one there reads the standard backwards. |
+| A **yellow taxi** filling the projected curve scored a yellow fraction of 1.0 | also require the yellow to span ≥ 60% of the fit's own range | A thing at a place occupies a band of range; paint runs the length of the road. Relative, not absolute — fits on dashed markings are routinely 7–8 m long and an absolute 12 m floor rejected correct ones. |
+| Taxis again, when they happen to lie along the fit | `exclude_boxes_px`: yellow inside a detected object box is discounted | The one place the detector feeds back into lane understanding. No colour or shape test separates a taxi's flank from paint; a box around it says so directly. |
+
+Detections fell 33 → 14, every survivor on the correct side, and spot-rendering
+the survivors put most of them right. **This is a heuristic on a colour cue, not
+a measurement**: it is regional (the yellow convention does not hold in the UK,
+Japan, Australia or much of Europe), it depends on a lane fit that is itself weak
+on cluttered urban scenes, and no ground truth for it was available, so the
+precision above is my own reading of rendered frames, not a scored metric.
+
+### State, not event
+
+`CarriagewayTracker` is deliberately **not** shaped like `SplitTracker`. A fork
+is announced once and then passed. A divided road stays true, so once confirmed
+it is reported on *every* frame and decays only after the evidence has been
+absent for a while. Announcing it once and forgetting would leave the fusion
+layer with no idea, ten seconds later, whether the traffic to its left is
+oncoming. Both trackers pick the divider's side by **majority** across the
+window: the side is the one thing that must not flicker, since reversing it
+inverts the meaning of every object on half the road.
+
+### Rendering
+
+`core.overlay.draw_carriageway` tints the two halves rather than outlining them
+— the useful fact is which region is which, not where the line is. Ego side
+green, oncoming side amber (the colour used throughout for "traffic that is not
+yours"), divider drawn as a double line in road yellow. The oncoming region is
+filled out to the frame edge and bounded above by the horizon: its outer edge is
+usually unmarked or out of frame, so claiming a specific width for it would be
+drawing a measurement that was never taken.
 
 ## Lane departure and lane change
 

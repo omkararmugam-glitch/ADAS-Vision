@@ -5,13 +5,18 @@
 Produces ``outputs/sections/`` with one folder per capability::
 
     01_lane_detection/    lane pixels and the fitted boundaries, nothing else
-    02_lane_split/        frames where a fork or exit ramp was found
-    03_vehicles/          vehicle boxes only
-    04_pedestrians/       people, cyclists, motorcyclists only
-    05_traffic_control/   lights with the colour read from their pixels, and signs
-    06_distance_ttc/      distance lines from the ego to each object
-    07_tracking/          persistent track ids
-    08_full_pipeline/     everything composited, as the pipeline really outputs it
+    02_lane_split/        frames where a fork or exit ramp opens up ahead
+    03_divided_highway/   roads already split into opposing directions of travel
+    04_vehicles/          vehicle boxes only
+    05_pedestrians/       people, cyclists, motorcyclists only
+    06_traffic_control/   lights with the colour read from their pixels, and signs
+    07_distance_ttc/      distance lines from the ego to each object
+    08_tracking/          persistent track ids
+    09_full_pipeline/     everything composited, as the pipeline really outputs it
+
+Sections 2 and 3 answer questions that sound alike and are not. Section 2 is a
+road *about to divide* -- take the left fork or the right one. Section 3 is a
+road *already divided*, where the far side carries traffic coming the other way.
     index.html            gallery linking all of them
 
 One capability per image, deliberately. The composite proves the modules run
@@ -50,11 +55,13 @@ from core.overlay import (
     draw_lane_area,
     draw_lane_fits,
     draw_split,
+    draw_carriageway,
     draw_split_smooth,
     lane_hud_lines,
 )
 from core.types import CLASS_IDS, FrameResult, LaneSet, LaneStatus, class_name
 from fusion.engine import DecisionEngine
+from models.lane_seg.carriageway import detect_carriageway
 from models.lane_seg.classical import ClassicalLaneSegmenter
 from models.lane_seg.fitting import LaneFitter
 from models.lane_seg.split import detect_split
@@ -69,13 +76,14 @@ CONTROL = {"traffic_light", "traffic_sign"}
 
 SECTIONS: list[tuple[str, str]] = [
     ("01_lane_detection", "Lane detection — segmented pixels and the fitted boundaries"),
-    ("02_lane_split", "Road splits — forks, exit ramps, dividing carriageways"),
-    ("03_vehicles", "Vehicle detection"),
-    ("04_pedestrians", "Pedestrians, cyclists and motorcyclists"),
-    ("05_traffic_control", "Traffic lights (with colour) and signs"),
-    ("06_distance_ttc", "Distance from the ego vehicle, and time-to-collision"),
-    ("07_tracking", "Multi-object tracking with persistent ids"),
-    ("08_full_pipeline", "Everything composited, as the pipeline outputs it"),
+    ("02_lane_split", "Road splits ahead — forks and exit ramps, where the road divides"),
+    ("03_divided_highway", "Divided roads — the two directions of travel, and which side is oncoming"),
+    ("04_vehicles", "Vehicle detection"),
+    ("05_pedestrians", "Pedestrians, cyclists and motorcyclists"),
+    ("06_traffic_control", "Traffic lights (with colour) and signs"),
+    ("07_distance_ttc", "Distance from the ego vehicle, and time-to-collision"),
+    ("08_tracking", "Multi-object tracking with persistent ids"),
+    ("09_full_pipeline", "Everything composited, as the pipeline outputs it"),
 ]
 
 
@@ -154,7 +162,7 @@ a{{color:var(--accent)}}
 it can be judged separately. Click a thumbnail for full resolution; the folder
 name under each card holds the rest.</p>
 <div class="banner"><p><strong>One capability per image, deliberately.</strong>
-The composite in section 8 proves the modules run together, but on a busy
+The composite in section 9 proves the modules run together, but on a busy
 junction every overlay lands on top of every other and a wrong lane fit looks
 much like a right one. Isolated, each module can be judged on its own &mdash;
 which is how the zebra-crossing weakness in the lane segmenter became visible.</p></div>
@@ -179,6 +187,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.clean and args.out.exists():
         shutil.rmtree(args.out)
+    known = {name for name, _ in SECTIONS}
+    # Drop section folders that no longer exist in SECTIONS. Without this a
+    # renumbering leaves the old folders behind and the index quietly disagrees
+    # with what is on disk -- exactly the clutter these sections exist to fix.
+    if args.out.is_dir():
+        for stale in sorted(args.out.iterdir()):
+            if stale.is_dir() and stale.name not in known:
+                shutil.rmtree(stale)
+                print(f"removed stale section {stale.name}/")
     for name, _ in SECTIONS:
         (args.out / name).mkdir(parents=True, exist_ok=True)
 
@@ -239,6 +256,11 @@ def main(argv: list[str] | None = None) -> int:
             lanes,
             min_divergence_ratio=cfg.fusion.lane_change.split_min_ratio,
             min_widening_m=cfg.fusion.lane_change.split_min_widening_m)
+        # Vehicle boxes are passed in so a yellow car cannot be read as a
+        # yellow line -- see models/lane_seg/carriageway.py.
+        carriageway = detect_carriageway(
+            lanes, cam, lane.yellow_mask,
+            exclude_boxes_px=np.asarray(result.boxes_px).reshape(-1, 4))
         decision = engine.update(0, 0.0, objects, lanes)
 
         names = [class_name(int(c)) for c in result.class_ids]
@@ -252,7 +274,7 @@ def main(argv: list[str] | None = None) -> int:
         # a handful of surviving pixels passes that and fits one boundary, which
         # showcases nothing. Require the full fit -- both boundaries and a road-
         # width lane -- so the section shows the capability rather than its
-        # failure mode. The failures are still visible in section 8.
+        # failure mode. The failures are still visible in section 9.
         lane_is_showcase = (
             lanes.status is LaneStatus.OK
             and lanes.ego_left is not None and lanes.ego_right is not None
@@ -283,52 +305,64 @@ def main(argv: list[str] | None = None) -> int:
                         [cv2.IMWRITE_JPEG_QUALITY, 90])
             counts["02_lane_split"] += 1
 
-        # 03 vehicles
+        # 03 divided highway. Distinct from 02: not a road about to fork, but a
+        # road whose far half is already carrying traffic the other way.
+        if (counts["03_divided_highway"] < args.n and carriageway is not None
+                and cam is not None):
+            vis = draw_carriageway(frame, carriageway, lanes, cam, cfg.overlay)
+            note = (f"{carriageway.kind.value.replace('_', ' ')}, oncoming "
+                    f"{carriageway.divider_side}, conf {carriageway.confidence:.2f}")
+            cv2.imwrite(str(args.out / "03_divided_highway" / f"{stem}.jpg"),
+                        _titled(vis, "divided highway", note, (40, 215, 245)),
+                        [cv2.IMWRITE_JPEG_QUALITY, 90])
+            counts["03_divided_highway"] += 1
+
+        # 04 vehicles
         n_veh = names.count("vehicle")
-        if counts["03_vehicles"] < args.n and n_veh >= 3:
+        if counts["04_vehicles"] < args.n and n_veh >= 3:
             vis = draw_boxes(frame.copy(), _subset(result, {"vehicle"}), cfg.overlay)
-            cv2.imwrite(str(args.out / "03_vehicles" / f"{stem}.jpg"),
+            cv2.imwrite(str(args.out / "04_vehicles" / f"{stem}.jpg"),
                         _titled(vis, "vehicles", f"{n_veh} detected"),
                         [cv2.IMWRITE_JPEG_QUALITY, 90])
-            counts["03_vehicles"] += 1
+            counts["04_vehicles"] += 1
 
         # 04 pedestrians / VRU
         n_vru = sum(names.count(k) for k in VRU)
-        if counts["04_pedestrians"] < args.n and n_vru >= 1:
+        if counts["05_pedestrians"] < args.n and n_vru >= 1:
             vis = draw_boxes(frame.copy(), _subset(result, VRU), cfg.overlay)
-            cv2.imwrite(str(args.out / "04_pedestrians" / f"{stem}.jpg"),
+            cv2.imwrite(str(args.out / "05_pedestrians" / f"{stem}.jpg"),
                         _titled(vis, "pedestrians and cyclists", f"{n_vru} detected"),
                         [cv2.IMWRITE_JPEG_QUALITY, 90])
-            counts["04_pedestrians"] += 1
+            counts["05_pedestrians"] += 1
 
         # 05 traffic control
         n_ctrl = sum(names.count(k) for k in CONTROL)
-        if counts["05_traffic_control"] < args.n and n_ctrl >= 1:
+        if counts["06_traffic_control"] < args.n and n_ctrl >= 1:
             vis = draw_boxes(frame.copy(), _subset(result, CONTROL), cfg.overlay)
             li = np.flatnonzero(np.asarray(result.class_ids) == light_id)
             states = (classify_lights(frame, np.asarray(result.boxes_px)[li])
                       if li.size else [])
             read = ", ".join(s.colour for s in states if s.colour != "unknown") or "unreadable"
-            cv2.imwrite(str(args.out / "05_traffic_control" / f"{stem}.jpg"),
+            cv2.imwrite(str(args.out / "06_traffic_control" / f"{stem}.jpg"),
                         _titled(vis, "traffic lights and signs",
                                 f"{n_ctrl} found; {read}"),
                         [cv2.IMWRITE_JPEG_QUALITY, 90])
-            counts["05_traffic_control"] += 1
+            counts["06_traffic_control"] += 1
 
         # 06 distance / TTC
         measured = [o for o in objects if o.distance_m is not None]
-        if counts["06_distance_ttc"] < args.n and cam is not None and len(measured) >= 2:
+        if counts["07_distance_ttc"] < args.n and cam is not None and len(measured) >= 2:
             vis = draw_distance_lines(frame.copy(), objects, cam, cfg.overlay,
                                       max_lines=6)
             nearest = min(o.distance_m for o in measured)
-            cv2.imwrite(str(args.out / "06_distance_ttc" / f"{stem}.jpg"),
+            cv2.imwrite(str(args.out / "07_distance_ttc" / f"{stem}.jpg"),
                         _titled(vis, "distance to objects",
                                 f"{len(measured)} measured; nearest {nearest:.1f} m"),
                         [cv2.IMWRITE_JPEG_QUALITY, 90])
-            counts["06_distance_ttc"] += 1
+            counts["07_distance_ttc"] += 1
 
         # 07 tracking
-        if counts["07_tracking"] < args.n and len(objects) >= 3:
+        if counts["08_tracking"] < args.n and len(objects) >= 3:
             ids = {}
             det_boxes = np.asarray(result.boxes_px).reshape(-1, 4)
             from tracking.bytetrack import iou_matrix
@@ -339,13 +373,13 @@ def main(argv: list[str] | None = None) -> int:
                 if ious[d, j] >= 0.5:
                     ids[d] = objects[j].track_id
             vis = draw_boxes(frame.copy(), result, cfg.overlay, track_ids=ids)
-            cv2.imwrite(str(args.out / "07_tracking" / f"{stem}.jpg"),
+            cv2.imwrite(str(args.out / "08_tracking" / f"{stem}.jpg"),
                         _titled(vis, "tracking", f"{len(objects)} tracked ids"),
                         [cv2.IMWRITE_JPEG_QUALITY, 90])
-            counts["07_tracking"] += 1
+            counts["08_tracking"] += 1
 
         # 08 full pipeline
-        if counts["08_full_pipeline"] < args.n and len(objects) >= 2:
+        if counts["09_full_pipeline"] < args.n and len(objects) >= 2:
             per_class: dict[str, int] = {}
             for nm in names:
                 per_class[nm] = per_class.get(nm, 0) + 1
@@ -364,11 +398,11 @@ def main(argv: list[str] | None = None) -> int:
                 vis = draw_distance_lines(vis, objects, cam, cfg.overlay, max_lines=4)
             if split is not None and cam is not None:
                 vis = draw_split(vis, split, lanes, cam, cfg.overlay)
-            cv2.imwrite(str(args.out / "08_full_pipeline" / f"{stem}.jpg"),
+            cv2.imwrite(str(args.out / "09_full_pipeline" / f"{stem}.jpg"),
                         _titled(vis, "full pipeline",
                                 f"{len(decision.alerts)} alerts"),
                         [cv2.IMWRITE_JPEG_QUALITY, 90])
-            counts["08_full_pipeline"] += 1
+            counts["09_full_pipeline"] += 1
 
     detector.close()
     index = build_index(args.out, counts)

@@ -9,9 +9,9 @@ lane fit is indistinguishable from a right one under the clutter.
 
 This lays the same frame out as a grid, one module per panel:
 
-    original          |  lane segmentation + fit
-    detections        |  distance and tracking
-    road split        |  everything composited
+    original          |  lane pixels        |  lane fit
+    detections        |  distance/tracking  |  road split ahead
+    divided highway   |  everything composited
 
 Each panel carries only its own ink, so a bad lane fit is obvious *as a bad lane
 fit* rather than as general mess. The composite is kept as the last panel,
@@ -36,6 +36,7 @@ from core.calibrate import CameraModel
 from core.config import load_config
 from core.overlay import (
     annotate,
+    draw_carriageway,
     draw_boxes,
     draw_distance_lines,
     draw_lane_fits,
@@ -46,6 +47,7 @@ from core.types import CLASS_IDS, FrameResult, LaneSet, LaneStatus, class_name
 from fusion.engine import DecisionEngine
 from models.lane_seg.classical import ClassicalLaneSegmenter
 from models.lane_seg.fitting import LaneFitter
+from models.lane_seg.carriageway import detect_carriageway
 from models.lane_seg.split import detect_split
 from models.perception.factory import build_detector
 from models.perception.traffic_light import classify_lights
@@ -141,6 +143,9 @@ def main(argv: list[str] | None = None) -> int:
             lanes,
             min_divergence_ratio=cfg.fusion.lane_change.split_min_ratio,
             min_widening_m=cfg.fusion.lane_change.split_min_widening_m)
+        carriageway = detect_carriageway(
+            lanes, cam, lane.yellow_mask,
+            exclude_boxes_px=np.asarray(result.boxes_px).reshape(-1, 4))
         decision = engine.update(idx, idx / 30.0, objects, lanes)
 
         counts: dict[str, int] = {}
@@ -192,6 +197,17 @@ def main(argv: list[str] | None = None) -> int:
              f"(x{split.divergence_ratio:.2f})") if split else "no split",
             (90, 190, 255) if split else (150, 150, 150))
 
+        cw_vis = frame.copy()
+        if carriageway is not None and cam is not None:
+            cw_vis = draw_carriageway(cw_vis, carriageway, lanes, cam, cfg.overlay,
+                                      show_label=False)
+        p_cw = _panel(
+            cw_vis, "7. divided highway",
+            (f"oncoming {carriageway.divider_side}, "
+             f"{carriageway.ego_lanes}+{carriageway.oncoming_lanes} lanes")
+            if carriageway else "not divided",
+            (40, 215, 245) if carriageway else (150, 150, 150))
+
         hud = [f"{path.name}",
                "objects: " + (", ".join(f"{v} {k}" for k, v in sorted(counts.items()))
                               or "none"),
@@ -207,11 +223,12 @@ def main(argv: list[str] | None = None) -> int:
                         cfg.overlay, hud, warnings)
         if cam is not None and objects:
             comp = draw_distance_lines(comp, objects, cam, cfg.overlay, max_lines=4)
-        p_all = _panel(comp, "7. everything composited",
+        p_all = _panel(comp, "8. everything composited",
                        f"{len(decision.alerts)} alerts",
                        (110, 140, 240) if decision.alerts else (150, 150, 150))
 
-        panels = [p_original, p_mask, p_fit, p_det, p_dist, p_split, p_all]
+        panels = [p_original, p_mask, p_fit, p_det, p_dist, p_split,
+                  p_cw, p_all]
         scale = args.panel_width / panels[0].shape[1]
         panels = [cv2.resize(p, (args.panel_width, int(p.shape[0] * scale)))
                   for p in panels]
@@ -225,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
         cv2.imwrite(str(dst), sheet, [cv2.IMWRITE_JPEG_QUALITY, 90])
         print(f"  {dst.name}: lane={lanes.status.value}, "
               f"{len(objects)} tracked, split={'yes' if split else 'no'}, "
+              f"divided={'yes' if carriageway else 'no'}, "
               f"{len(decision.alerts)} alerts")
 
     detector.close()

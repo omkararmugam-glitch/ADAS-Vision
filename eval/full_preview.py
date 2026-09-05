@@ -37,11 +37,19 @@ sys.path.insert(0, str(PROJECT))
 from core.autocalib import estimate as autocalib_estimate
 from core.calibrate import CameraModel
 from core.config import load_config
-from core.overlay import annotate, draw_distance_lines, draw_split, lane_hud_lines
+from core.overlay import (
+    annotate,
+    carriageway_hud_lines,
+    draw_carriageway,
+    draw_distance_lines,
+    draw_split,
+    lane_hud_lines,
+)
 from core.types import CLASS_IDS, FrameResult, LaneStatus, class_name
 from fusion.engine import DecisionEngine
 from models.lane_seg.classical import ClassicalLaneSegmenter
 from models.lane_seg.fitting import LaneFitter
+from models.lane_seg.carriageway import detect_carriageway
 from models.lane_seg.split import detect_split
 from models.perception.factory import build_detector
 from models.perception.traffic_light import classify_lights
@@ -191,6 +199,9 @@ def main(argv: list[str] | None = None) -> int:
             min_divergence_ratio=cfg.fusion.lane_change.split_min_ratio,
             min_widening_m=cfg.fusion.lane_change.split_min_widening_m,
         )
+        carriageway = detect_carriageway(
+            lanes, frame_camera, mask_result.yellow_mask,
+            exclude_boxes_px=np.asarray(result.boxes_px).reshape(-1, 4))
 
         # Map detections to track ids and distances by overlap, not index.
         track_ids, distances = {}, {}
@@ -216,6 +227,7 @@ def main(argv: list[str] | None = None) -> int:
             f"frame {i:>3}   {path.name}",
             "objects: " + (", ".join(f"{v} {k}" for k, v in sorted(counts.items())) or "none"),
             *lane_hud_lines(lanes),
+            *carriageway_hud_lines(carriageway),
             f"lane px: {mask_result.coverage * 100:.2f}% of road ROI",
         ]
         if lights_txt:
@@ -248,6 +260,12 @@ def main(argv: list[str] | None = None) -> int:
             vis = draw_distance_lines(vis, objects, frame_camera, cfg.overlay)
         if split is not None and frame_camera is not None:
             vis = draw_split(vis, split, lanes, frame_camera, cfg.overlay)
+        if carriageway is not None and frame_camera is not None:
+            # No label here: the composite already carries the HUD line, and a
+            # second banner over the same fact is what made these frames
+            # unreadable in the first place.
+            vis = draw_carriageway(vis, carriageway, lanes, frame_camera,
+                                   cfg.overlay, show_label=False)
         dst = args.out / f"{i:03d}_{path.stem}.jpg"
         cv2.imwrite(str(dst), vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
         written.append(dst)

@@ -701,3 +701,128 @@ class VideoWriter:
             path=str(self.path), frames=self.frames_written,
             status="error" if exc_type else "ok",
         )
+
+
+# A divided highway is rendered as two half-roads, not two curves. The ego
+# carriageway keeps the familiar green; the opposing one is amber, the colour
+# used everywhere else in this project for "traffic that is not yours". The
+# divider itself is drawn in the yellow it is painted in on the road.
+CARRIAGEWAY_EGO_COLOR = (90, 230, 90)        # BGR: green
+CARRIAGEWAY_ONCOMING_COLOR = (60, 170, 255)  # BGR: amber
+CARRIAGEWAY_DIVIDER_COLOR = (40, 215, 245)   # BGR: road yellow
+
+
+def draw_carriageway(
+    image: np.ndarray,
+    carriageway,
+    lanes: LaneSet,
+    camera: CameraModel,
+    cfg: OverlayConfig,
+    alpha: float = 0.28,
+    show_label: bool = True,
+) -> np.ndarray:
+    """Render a divided highway: ego side, divider, oncoming side.
+
+    The two halves are tinted rather than outlined, because the useful fact is
+    not where the line is but which region is which. A driver -- or a reviewer
+    checking the output -- reads "the amber half is coming towards me" instantly
+    and reads a line annotated ``divider`` not at all.
+
+    The oncoming region is filled out to the frame edge beyond the divider. That
+    is an honest depiction of what is known: the far carriageway's outer edge is
+    usually unmarked or out of frame, so claiming a specific width for it would
+    be drawing a measurement that was never taken.
+    """
+    if carriageway is None:
+        return image
+    from models.lane_seg.fitting import fit_to_image_points
+
+    divider = next((f for f in lanes.all_fits()
+                    if f.role == carriageway.divider_role), None)
+    if divider is None:
+        return image
+
+    lo, hi = divider.y_range_m
+    div_pts = fit_to_image_points(divider, camera, (lo, hi), n_samples=160)
+    if len(div_pts) < 2:
+        return image
+
+    h, w = image.shape[:2]
+    vis = image.copy()
+    overlay = vis.copy()
+
+    # The oncoming half: everything between the divider and the frame edge on
+    # the divider's side. The region runs down to the bottom of the frame rather
+    # than stopping at the near end of the fit -- the road does not end where
+    # the fitted pixels do, and a horizontal stripe floating in the middle of
+    # the image reads as a rendering artefact rather than as half a road.
+    # Its upper edge follows the horizon rather than running flat across at the
+    # divider's far row, which tinted whatever buildings happened to be there.
+    # Nothing above the vanishing line is road, so nothing above it can be the
+    # other carriageway.
+    edge_x = 0 if carriageway.divider_side == "left" else w - 1
+    v_horizon = float(np.asarray(camera.horizon_v(float(edge_x))).reshape(-1)[0])
+    if not np.isfinite(v_horizon):
+        v_horizon = float(div_pts[-1][1])
+    v_top = float(np.clip(max(v_horizon, 0.0), 0, h - 1))
+    poly = np.vstack([
+        div_pts,                            # near to far along the divider
+        [[edge_x, v_top]],                  # out to the frame edge at the horizon
+        [[edge_x, h - 1]],                  # down the frame edge
+        [[div_pts[0][0], h - 1]],           # back under the near end
+    ]).astype(np.int32)
+    cv2.fillPoly(overlay, [poly], CARRIAGEWAY_ONCOMING_COLOR)
+
+    # The ego half: between the divider and whichever ego boundary is on the
+    # other side of the vehicle. Skipped when that boundary was not fitted --
+    # a tint with one edge invented would misreport the lane's width.
+    other = (lanes.ego_right if carriageway.divider_side == "left"
+             else lanes.ego_left)
+    if other is not None and other.role != divider.role:
+        olo = max(lo, other.y_range_m[0])
+        ohi = min(hi, other.y_range_m[1])
+        if ohi > olo:
+            a = fit_to_image_points(divider, camera, (olo, ohi), n_samples=160)
+            b = fit_to_image_points(other, camera, (olo, ohi), n_samples=160)
+            if len(a) >= 2 and len(b) >= 2:
+                cv2.fillPoly(overlay, [np.vstack([a, b[::-1]]).astype(np.int32)],
+                             CARRIAGEWAY_EGO_COLOR)
+
+    cv2.addWeighted(overlay, alpha, vis, 1 - alpha, 0, vis)
+
+    # The divider drawn as a double line, which is what a real one usually is,
+    # and which distinguishes it at a glance from an ordinary lane boundary.
+    for shift in (-5, 5):
+        shifted = div_pts.copy()
+        shifted[:, 0] += shift
+        cv2.polylines(vis, [shifted.reshape(-1, 1, 2).astype(np.int32)], False,
+                      CARRIAGEWAY_DIVIDER_COLOR, 5, cv2.LINE_AA)
+
+    if show_label:
+        onc_side = "left" if carriageway.divider_side == "left" else "right"
+        lines = [
+            f"DIVIDED HIGHWAY  ({carriageway.kind.value.replace('_', ' ')})",
+            f"oncoming traffic on the {onc_side}  |  "
+            f"{carriageway.ego_lanes} ego / {carriageway.oncoming_lanes}+ opposing",
+        ]
+        if carriageway.median_width_m is not None:
+            lines.append(f"median {carriageway.median_width_m:.1f} m wide")
+        y0 = vis.shape[0] - 18 - 26 * (len(lines) - 1)
+        for i, text in enumerate(lines):
+            scale = 0.66 if i == 0 else 0.54
+            colour = CARRIAGEWAY_DIVIDER_COLOR if i == 0 else (235, 235, 235)
+            (tw, th), base = cv2.getTextSize(text, FONT, scale, 2)
+            x, y = 16, y0 + 26 * i
+            cv2.rectangle(vis, (x - 9, y - th - base - 3), (x + tw + 9, y + base + 1),
+                          (24, 24, 24), -1)
+            cv2.putText(vis, text, (x, y), FONT, scale, colour, 2, cv2.LINE_AA)
+    return vis
+
+
+def carriageway_hud_lines(carriageway) -> list[str]:
+    """One-line summary for the HUD stack."""
+    if carriageway is None:
+        return []
+    return [f"road   : divided, oncoming {carriageway.divider_side}, "
+            f"{carriageway.ego_lanes}+{carriageway.oncoming_lanes} lanes "
+            f"(conf {carriageway.confidence:.2f})"]
