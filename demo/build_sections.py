@@ -59,6 +59,7 @@ from core.overlay import (
     draw_split_smooth,
     lane_hud_lines,
 )
+from core.scene import draw_scene, scene_status_rows
 from core.types import CLASS_IDS, FrameResult, LaneSet, LaneStatus, class_name
 from fusion.engine import DecisionEngine
 from models.lane_seg.carriageway import detect_carriageway
@@ -282,12 +283,16 @@ def main(argv: list[str] | None = None) -> int:
             and 2.4 <= lanes.lane_width_m <= 4.8
         )
         if counts["01_lane_detection"] < args.n and lane_is_showcase and cam is not None:
-            vis = draw_lane_area(frame, lanes, cam, cfg.overlay)
+            vis = draw_scene(
+                frame, lanes, cam, cfg.overlay,
+                status_rows=scene_status_rows(lanes),
+                show_badge=False, show_labels=True)
             vis = draw_debug_strip(vis, [
                 ("lane pixels", lane.mask),
                 ("input", cv2.resize(frame, (frame.shape[1] // 4, frame.shape[0] // 4))),
             ])
             note = f"{lanes.status.value}"
+            note += "  parallel" if lanes.parallel_model else "  independent"
             if lanes.lane_width_m:
                 note += f"  width {lanes.lane_width_m:.2f} m"
             cv2.imwrite(str(args.out / "01_lane_detection" / f"{stem}.jpg"),
@@ -296,8 +301,14 @@ def main(argv: list[str] | None = None) -> int:
             counts["01_lane_detection"] += 1
 
         # 02 lane split
-        if counts["02_lane_split"] < args.n and split is not None and cam is not None:
-            vis = draw_split_smooth(frame, split, lanes, cam, cfg.overlay)
+        # Require a full lane fit, as section 01 does. A split found on a
+        # single boundary has no corridor to show it against, and the section
+        # would advertise the capability with its failure mode.
+        if (counts["02_lane_split"] < args.n and split is not None
+                and cam is not None and lanes.status is LaneStatus.OK):
+            vis = draw_scene(
+                frame, lanes, cam, cfg.overlay, split=split,
+                status_rows=scene_status_rows(lanes, split))
             cv2.imwrite(str(args.out / "02_lane_split" / f"{stem}.jpg"),
                         _titled(vis, "road split",
                                 f"{split.side.value} @ {split.gore_distance_m:.0f} m "
@@ -308,8 +319,10 @@ def main(argv: list[str] | None = None) -> int:
         # 03 divided highway. Distinct from 02: not a road about to fork, but a
         # road whose far half is already carrying traffic the other way.
         if (counts["03_divided_highway"] < args.n and carriageway is not None
-                and cam is not None):
-            vis = draw_carriageway(frame, carriageway, lanes, cam, cfg.overlay)
+                and cam is not None and lanes.status is LaneStatus.OK):
+            vis = draw_scene(
+                frame, lanes, cam, cfg.overlay, carriageway=carriageway,
+                status_rows=scene_status_rows(lanes, None, carriageway))
             note = (f"{carriageway.kind.value.replace('_', ' ')}, oncoming "
                     f"{carriageway.divider_side}, conf {carriageway.confidence:.2f}")
             cv2.imwrite(str(args.out / "03_divided_highway" / f"{stem}.jpg"),

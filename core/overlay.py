@@ -632,11 +632,26 @@ def annotate(
     Masks first so boxes and curves sit on top of them; the fitted curves last of
     the geometry so they remain readable over the lane mask they are checked
     against.
+
+    Lane geometry is delegated to :mod:`core.scene` -- the filled corridor,
+    green left boundary, red right boundary and dashed predicted path -- so the
+    composite and the per-capability sections speak the same visual language
+    and, more importantly, share the same guards against a diverging fit being
+    drawn as a confident line.
     """
+    from core.scene import draw_boundaries, draw_drivable_area, draw_predicted_path
+
     vis = draw_mask(image, result.drivable_mask, cfg, DRIVABLE_COLOR)
     if cfg.show_lane_mask:
         vis = draw_mask(vis, result.lane_mask, cfg, LANE_MASK_COLOR, alpha=cfg.lane_mask_alpha)
-    vis = draw_lane_fits(vis, lanes, camera, cfg)
+    if lanes.status is LaneStatus.NOT_DETECTED:
+        pass
+    elif lanes.ego_left is not None and lanes.ego_right is not None:
+        vis = draw_drivable_area(vis, lanes, camera)
+        vis = draw_boundaries(vis, lanes, camera)
+        vis = draw_predicted_path(vis, lanes, camera)
+    else:
+        vis = draw_boundaries(vis, lanes, camera)
     vis = draw_boxes(vis, result, cfg, distances_m=distances_m, track_ids=track_ids)
     vis = draw_status_corner(vis, cfg, weather, road_condition)
     return draw_hud(vis, hud_lines or [], cfg, warnings)

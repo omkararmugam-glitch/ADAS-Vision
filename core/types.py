@@ -25,7 +25,7 @@ import numpy as np
 
 #: Bumped whenever the on-disk serialisation changes. A cache written under a
 #: different value is stale and is never reused.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 # v3 appended traffic_light and traffic_sign to CLASS_NAMES. A v2 cache saw
 # neither, and reading one as v3 would imply the run had looked for signals and
 # found none -- silently turning "never checked" into "checked, nothing there".
@@ -309,6 +309,13 @@ class LaneSet:
             onto the wrong markings.
         eval_distance_m: Forward distance the three scalars above were
             evaluated at.
+        parallel_model: True when the two ego boundaries were fitted with one
+            shared curvature rather than independently. When set, the far field
+            of each boundary is supported by the *pair's* pixels, so the curves
+            may be trusted to the far end of the union of their supports. When
+            clear, the boundaries were not consistent with being parallel --
+            which is what a fork looks like -- and each is only as good as its
+            own pixels.
     """
 
     status: LaneStatus
@@ -319,6 +326,7 @@ class LaneSet:
     ego_offset_m: float | None = None
     lane_width_m: float | None = None
     eval_distance_m: float = 0.0
+    parallel_model: bool = False
 
     @property
     def detected(self) -> bool:
@@ -341,6 +349,7 @@ class LaneSet:
             "ego_offset_m": _json_float(self.ego_offset_m),
             "lane_width_m": _json_float(self.lane_width_m),
             "eval_distance_m": float(self.eval_distance_m),
+            "parallel_model": bool(self.parallel_model),
         }
 
     @classmethod
@@ -354,6 +363,7 @@ class LaneSet:
             ego_offset_m=_from_json_float(d["ego_offset_m"]),
             lane_width_m=_from_json_float(d["lane_width_m"]),
             eval_distance_m=float(d["eval_distance_m"]),
+            parallel_model=bool(d.get("parallel_model", False)),
         )
 
 

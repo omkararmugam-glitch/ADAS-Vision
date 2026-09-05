@@ -10,6 +10,9 @@ Pipeline for one frame:
 3. Locate boundary bases from a lateral histogram of the near field.
 4. Track each boundary away from the camera with sliding windows.
 5. Fit ``x = a*y^2 + b*y + c`` per boundary by least squares.
+6. Test the pair against a **parallel** model -- one shared curvature, two
+   offsets -- and adopt it when it fits nearly as well. See
+   :func:`fit_parallel_pair`.
 
 Coordinate frames: input mask is **image px**; everything returned is in
 **ego metres**, X right and Y forward from the camera's ground projection.
@@ -40,6 +43,17 @@ _log = get_logger(__name__)
 #: A quadratic needs the samples to span some forward distance; fitting one to a
 #: sliver of rows produces wild coefficients that mean nothing.
 _MIN_Y_SPAN_M = 3.0
+
+#: How much worse the parallel model may fit before it is rejected. It can never
+#: fit *better* -- it is the same model with a parameter removed -- so the
+#: question is only whether the extra freedom bought anything. A quarter more
+#: residual is the price paid for a far field that does not fly apart.
+_PARALLEL_TOLERANCE = 1.25
+
+#: Absolute slack, in metres of RMS, added to the tolerance above. Without it a
+#: near-perfect independent fit (rms ~ 0.01 m, common on solid markings) makes
+#: the ratio test absurdly strict for no practical gain.
+_PARALLEL_SLACK_M = 0.04
 
 
 class LaneFitter:
@@ -136,6 +150,12 @@ class LaneFitter:
                 centre = float(np.mean(x_m[in_window]))
         return selected
 
+    @staticmethod
+    def _rms(fit: LaneFit, x_m: np.ndarray, y_m: np.ndarray) -> float:
+        if not len(x_m):
+            return 0.0
+        return float(np.sqrt(np.mean((fit.x_at(y_m) - x_m) ** 2)))
+
     def _fit_one(self, x_m: np.ndarray, y_m: np.ndarray, role: str) -> LaneFit | None:
         """Least-squares quadratic for one boundary, or None if unsupportable."""
         n = len(x_m)
@@ -189,6 +209,9 @@ class LaneFitter:
         ego_right_base = min(right_bases) if right_bases else None
 
         fits: dict[str, LaneFit] = {}
+        # The selected pixels are kept, not just the fit: the parallel-model
+        # test below has to re-fit them jointly.
+        pixels: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         for base, role in ((ego_left_base, "ego_left"), (ego_right_base, "ego_right")):
             if base is None:
                 continue
@@ -196,6 +219,7 @@ class LaneFitter:
             fit = self._fit_one(x_m[sel], y_m[sel], role)
             if fit is not None:
                 fits[role] = fit
+                pixels[role] = (x_m[sel], y_m[sel])
 
         adjacent: list[LaneFit] = []
         if self.cfg.adjacent_lanes:
@@ -248,6 +272,39 @@ class LaneFitter:
                 eval_distance_m=self.cfg.eval_distance_m,
             )
 
+        # ---- parallel-model selection ------------------------------------ #
+        # Both boundaries exist, so ask whether one shared curvature explains
+        # them. If it does, adopt it: the far field stops being two independent
+        # extrapolations and the reach of the better-supported boundary carries
+        # over to the weaker one. If it does not, the boundaries genuinely are
+        # not parallel -- a fork -- and the independent fits are the honest
+        # answer, which is also what detect_split needs to see.
+        parallel_used = False
+        if left.role in pixels and right.role in pixels:
+            xl, yl = pixels[left.role]
+            xr, yr = pixels[right.role]
+            joint = fit_parallel_pair(yl, xl, yr, xr)
+            if joint is not None:
+                coeffs_l, coeffs_r, rms_par = joint
+                rms_ind = max(self._rms(left, xl, yl), self._rms(right, xr, yr))
+                budget = rms_ind * _PARALLEL_TOLERANCE + _PARALLEL_SLACK_M
+                if rms_par <= budget:
+                    # Union of the two supports: with a shared curvature the
+                    # weak boundary's far end rests on the strong one's pixels,
+                    # so extending it there is evidence, not extrapolation.
+                    span = (
+                        min(left.y_range_m[0], right.y_range_m[0]),
+                        max(left.y_range_m[1], right.y_range_m[1]),
+                    )
+                    left = LaneFit(coeffs=coeffs_l, role=left.role,
+                                   n_pixels=left.n_pixels, y_range_m=span)
+                    right = LaneFit(coeffs=coeffs_r, role=right.role,
+                                    n_pixels=right.n_pixels, y_range_m=span)
+                    parallel_used = True
+                log_kv(_log, logging.DEBUG, "lanes.parallel_model",
+                       adopted=parallel_used, rms_parallel=f"{rms_par:.4f}",
+                       rms_independent=f"{rms_ind:.4f}", budget=f"{budget:.4f}")
+
         y_eval = self.cfg.eval_distance_m
         x_left = float(left.x_at(y_eval)[0])
         x_right = float(right.x_at(y_eval)[0])
@@ -270,7 +327,71 @@ class LaneFitter:
             ego_offset_m=-0.5 * (x_left + x_right),
             lane_width_m=x_right - x_left,
             eval_distance_m=y_eval,
+            parallel_model=parallel_used,
         )
+
+
+def fit_parallel_pair(
+    y_left: np.ndarray, x_left: np.ndarray,
+    y_right: np.ndarray, x_right: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, float] | None:
+    """Fit both ego boundaries with one shared curvature and two offsets.
+
+    Solves, in a single least-squares system::
+
+        x_left  = a*y^2 + b*y + c_left
+        x_right = a*y^2 + b*y + c_right
+
+    Four unknowns instead of six. The point is the **far field**. Fitted
+    independently, each boundary is extrapolated on its own evidence, and a
+    boundary supported by a short stub of dashed paint produces a quadratic that
+    is fine over that stub and flies off the road beyond it. Real lane
+    boundaries are parallel, so a boundary with good support out to 35 m can
+    lend its curvature to one that runs out of pixels at 12 m -- and then the
+    far end of the weak boundary is no longer a guess, it is a measurement made
+    on the other side of the lane.
+
+    It also makes the far field *self-consistent*: lane width stays constant by
+    construction, so the rendered corridor cannot silently fan open into the
+    nine-metre lane that the split detector exists to catch.
+
+    This is not applied blindly. The caller compares it against the independent
+    fit and keeps the independent one where the parallel model genuinely fails,
+    which is exactly what a fork looks like. See :meth:`LaneFitter.fit`.
+
+    Returns:
+        ``(coeffs_left, coeffs_right, rms)``, or None if the system is
+        underdetermined or degenerate.
+    """
+    y_l = np.asarray(y_left, dtype=np.float64).reshape(-1)
+    x_l = np.asarray(x_left, dtype=np.float64).reshape(-1)
+    y_r = np.asarray(y_right, dtype=np.float64).reshape(-1)
+    x_r = np.asarray(x_right, dtype=np.float64).reshape(-1)
+    n_l, n_r = len(y_l), len(y_r)
+    if n_l < 3 or n_r < 3:
+        return None
+
+    # Rows: [y^2, y, 1_left, 1_right]. The two indicator columns are what let
+    # one curvature serve both boundaries at different lateral offsets.
+    A = np.zeros((n_l + n_r, 4), dtype=np.float64)
+    A[:n_l, 0] = y_l ** 2
+    A[:n_l, 1] = y_l
+    A[:n_l, 2] = 1.0
+    A[n_l:, 0] = y_r ** 2
+    A[n_l:, 1] = y_r
+    A[n_l:, 3] = 1.0
+    b = np.concatenate([x_l, x_r])
+
+    try:
+        sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    if not np.all(np.isfinite(sol)):
+        return None
+
+    a, bb, c_l, c_r = (float(v) for v in sol)
+    rms = float(np.sqrt(np.mean((A @ sol - b) ** 2)))
+    return (np.array([a, bb, c_l]), np.array([a, bb, c_r]), rms)
 
 
 def fit_to_image_points(

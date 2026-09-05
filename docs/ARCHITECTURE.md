@@ -352,6 +352,85 @@ one. The promising route is the **learned segmenter**
 lacks and can learn that a crossing is not a lane — something no threshold on an
 individual component can express.
 
+## The scene view — one colour language
+
+`core/scene.py`. `core/overlay.py` holds the drawing primitives; this composes
+them into the single annotated view the system presents, with a fixed palette so
+the same fact always looks the same whichever script rendered the frame.
+
+| | Means |
+|---|---|
+| **Green** | your side: the ego corridor and its left boundary |
+| **Red** | do not enter: the right boundary, an exit branch, the oncoming carriageway |
+| **Blue, dashed** | the predicted path down the lane centre — a *path*, deliberately not an edge |
+
+Red carries two apparent meanings — "edge of your lane" and "region that is not
+yours" — but one idea: crossing it is the thing not to do. That is worth more
+than a palette in which every region has a hue and none of them mean anything.
+
+Dashes are spaced in **ground metres**, not pixels, then projected, so they
+foreshorten like real paint. A pixel-spaced dash reads as a dotted line drawn on
+the screen; a metre-spaced one reads as markings lying on the road.
+
+### Making the far field honest
+
+The reference behaviour asked for is a line that stays on the marking from the
+bonnet to the vanishing point. Four things were in the way, and each fix is a
+constraint rather than a nudge:
+
+**1. Boundaries were fitted independently.** Each was then extrapolated on its
+own pixels, so a boundary supported by a short stub of dashed paint gave a
+quadratic that was fine over the stub and left the road beyond it — precisely
+the part of the image a driver looks at. `fit_parallel_pair` solves both
+boundaries in one least-squares system with a **shared curvature** and two
+offsets: four unknowns instead of six. A boundary with support to 35 m now lends
+its curvature to one that runs out of paint at 12 m, and the weak boundary's far
+end becomes a measurement taken on the other side of the lane. Lane width is
+also constant by construction, so the corridor cannot silently fan open.
+
+It is not applied blindly — a shared curvature *cannot* represent a fork. The
+parallel model is adopted only when its residual is within
+`_PARALLEL_TOLERANCE` (1.25×, plus 4 cm slack) of the independent fit; a
+diverging pair blows past that and keeps its independent fits, which is what
+`detect_split` needs to see. `LaneSet.parallel_model` records which was used,
+and `scene.trusted_range` reads it: the union of supports when parallel, only
+the overlap when not.
+
+Measured on 300 random BDD100K frames, of the fits that reach status OK the
+parallel model is adopted on **84%**, and the *weaker* boundary's reach goes from
+**22.7 m to 37.4 m median**.
+
+**2. Curves were extended toward the camera.** Near the vehicle the
+ground-to-image projection is at its most sensitive, so a metre of harmless
+lateral error swung the drawn line clear across the bonnet. Near extension is
+now zero; the road immediately ahead is covered by `_extend_to_bottom`, a
+**straight continuation in image space**, which cannot diverge. It is capped at
+28% of frame height — a fit whose near end is already high in the image starts
+far away, and continuing it would invent more road than it measured.
+
+**3. Diverging quadratics were drawn in full.** `_project` truncates at
+`MAX_LATERAL_M` (9 m), so a curve that leaves the road *stops* instead of
+carrying on confidently across scenery.
+
+**4. The two corridor edges were extended separately** and could cross before
+reaching the bonnet, filling a bowtie. `_extend_pair_to_bottom` drops the
+extension for both when that would happen: a corridor stopping a few metres
+short is a smaller lie than one folding through itself.
+
+### Regions
+
+A fork's branch is drawn as a **lane-width band** (`BRANCH_WIDTH_M`, 3.6 m) —
+a branch is a lane and should look like one; its true width was not measured, and
+that assumption is stated rather than hidden. The opposing carriageway of a
+divided road *is* drawn out to the frame edge, bounded above by the horizon,
+because there the claim really is "everything past this line is theirs".
+
+A fork and a divided road are never tinted at once: they are different claims
+about the same region.
+
+`annotate()` delegates its lane geometry here, so the composite and the
+per-capability sections share both the language and the guards.
+
 ## Road splits — forks and exit ramps ahead
 
 The lane fitter assumes one continuous road with roughly parallel boundaries.
