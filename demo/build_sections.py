@@ -45,7 +45,9 @@ from core.config import load_config
 from core.overlay import (
     annotate,
     draw_boxes,
+    draw_debug_strip,
     draw_distance_lines,
+    draw_lane_area,
     draw_lane_fits,
     draw_split,
     lane_hud_lines,
@@ -241,12 +243,27 @@ def main(argv: list[str] | None = None) -> int:
         names = [class_name(int(c)) for c in result.class_ids]
         stem = path.stem
 
-        # 01 lane detection
-        if counts["01_lane_detection"] < args.n and lane.is_plausible:
-            vis = frame.copy()
-            vis[lane.mask > 0] = LANE_PIXEL_COLOUR
-            if cam is not None:
-                vis = draw_lane_fits(vis, lanes, cam, cfg.overlay)
+        # 01 lane detection -- filled corridor, not two thin curves. A fill
+        # shows at a glance whether the fit encloses the road actually being
+        # driven; a curve that has latched onto a kerb looks fine on its own.
+        #
+        # A *plausible mask* is not enough to select on: a rainy night frame with
+        # a handful of surviving pixels passes that and fits one boundary, which
+        # showcases nothing. Require the full fit -- both boundaries and a road-
+        # width lane -- so the section shows the capability rather than its
+        # failure mode. The failures are still visible in section 8.
+        lane_is_showcase = (
+            lanes.status is LaneStatus.OK
+            and lanes.ego_left is not None and lanes.ego_right is not None
+            and lanes.lane_width_m is not None
+            and 2.4 <= lanes.lane_width_m <= 4.8
+        )
+        if counts["01_lane_detection"] < args.n and lane_is_showcase and cam is not None:
+            vis = draw_lane_area(frame, lanes, cam, cfg.overlay)
+            vis = draw_debug_strip(vis, [
+                ("lane pixels", lane.mask),
+                ("input", cv2.resize(frame, (frame.shape[1] // 4, frame.shape[0] // 4))),
+            ])
             note = f"{lanes.status.value}"
             if lanes.lane_width_m:
                 note += f"  width {lanes.lane_width_m:.2f} m"
@@ -337,7 +354,9 @@ def main(argv: list[str] | None = None) -> int:
                    *lane_hud_lines(lanes)]
             warns = [("!! " if a.severity.value == "critical" else "!  ")
                      + a.message.upper() for a in decision.alerts]
-            vis = annotate(frame, result, lanes,
+            base = (draw_lane_area(frame, lanes, cam, cfg.overlay, show_metrics=False)
+                    if cam is not None else frame)
+            vis = annotate(base, result, lanes,
                            cam or CameraModel(H_image_to_ground=np.eye(3),
                                               image_size=(w, h)),
                            cfg.overlay, hud, warns)

@@ -232,6 +232,120 @@ def draw_hud(
     return vis
 
 
+#: The filled-lane rendering. Green for the drivable ego lane, blue for the left
+#: boundary, red for the right -- the convention from the classic lane-finding
+#: visualisation, chosen because it is instantly readable: a driver sees the
+#: corridor they are in, not two abstract curves.
+LANE_AREA_COLOR = (90, 230, 90)
+LANE_LEFT_COLOR = (235, 90, 60)     # BGR: blue
+LANE_RIGHT_COLOR = (60, 60, 235)    # BGR: red
+
+
+def draw_lane_area(
+    image: np.ndarray,
+    lanes: LaneSet,
+    camera: CameraModel,
+    cfg: OverlayConfig,
+    alpha: float = 0.32,
+    boundary_thickness: int = 14,
+    show_metrics: bool = True,
+) -> np.ndarray:
+    """Fill the ego lane and draw its boundaries thickly.
+
+    Replaces two thin curves with the corridor itself. The difference is not
+    decoration: a filled polygon shows at a glance whether the fit encloses the
+    road the vehicle is actually on, which two separate curves do not -- a fit
+    that has latched onto a kerb on one side looks perfectly reasonable as a
+    curve and obviously wrong as a filled region.
+
+    Falls back to drawing whichever boundaries exist when the lane is not fully
+    fitted, because a single boundary is still worth seeing; only the fill needs
+    both.
+    """
+    left, right = lanes.ego_left, lanes.ego_right
+    if left is None and right is None:
+        return image
+    from models.lane_seg.fitting import fit_to_image_points
+
+    vis = image.copy()
+
+    # Shared range, so the polygon does not extrapolate one side past the other.
+    if left is not None and right is not None:
+        lo = max(left.y_range_m[0], right.y_range_m[0])
+        hi = min(left.y_range_m[1], right.y_range_m[1])
+        if hi > lo:
+            lp = fit_to_image_points(left, camera, (lo, hi))
+            rp = fit_to_image_points(right, camera, (lo, hi))
+            if len(lp) >= 2 and len(rp) >= 2:
+                poly = np.vstack([lp, rp[::-1]]).astype(np.int32)
+                overlay = vis.copy()
+                cv2.fillPoly(overlay, [poly], LANE_AREA_COLOR)
+                cv2.addWeighted(overlay, alpha, vis, 1 - alpha, 0, vis)
+
+    for fit, colour in ((left, LANE_LEFT_COLOR), (right, LANE_RIGHT_COLOR)):
+        if fit is None:
+            continue
+        pts = fit_to_image_points(fit, camera)
+        if len(pts) < 2:
+            continue
+        cv2.polylines(vis, [pts.reshape(-1, 1, 2).astype(np.int32)], False,
+                      colour, boundary_thickness, cv2.LINE_AA)
+
+    if show_metrics:
+        rows = []
+        if lanes.curvature_radius_m is not None:
+            r = lanes.curvature_radius_m
+            # A straight road fits an enormous radius; printing "412739 m" is
+            # noise, so anything beyond a kilometre reads as straight.
+            rows.append("Curvature: straight" if not np.isfinite(r) or abs(r) > 1000
+                        else f"Curvature radius: {abs(r):.0f} m")
+        if lanes.ego_offset_m is not None:
+            side = "right" if lanes.ego_offset_m > 0 else "left"
+            rows.append(f"Offset from centre: {abs(lanes.ego_offset_m):.2f} m {side}")
+        if lanes.lane_width_m is not None:
+            rows.append(f"Lane width: {lanes.lane_width_m:.2f} m")
+        for i, text in enumerate(rows):
+            y = 34 + i * 30
+            (tw, th), base = cv2.getTextSize(text, FONT, 0.62, 2)
+            x = vis.shape[1] - tw - 18
+            cv2.rectangle(vis, (x - 8, y - th - base - 2), (x + tw + 8, y + base),
+                          (26, 26, 26), -1)
+            cv2.putText(vis, text, (x, y), FONT, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
+    return vis
+
+
+def draw_debug_strip(
+    image: np.ndarray,
+    panels: list[tuple[str, np.ndarray]],
+    height: int = 150,
+) -> np.ndarray:
+    """Inset small diagnostic views along the top of the frame.
+
+    The intermediate stages are what explain a bad lane fit -- a mask full of
+    zebra stripes, or a bird's-eye view where the markings are not parallel.
+    Keeping them beside the result means a failure can be diagnosed from the
+    output image alone, without re-running anything.
+    """
+    if not panels:
+        return image
+    vis = image.copy()
+    x = 10
+    for label, panel in panels:
+        if panel is None or panel.size == 0:
+            continue
+        if panel.ndim == 2:
+            panel = cv2.cvtColor(panel, cv2.COLOR_GRAY2BGR)
+        w = int(panel.shape[1] * height / panel.shape[0])
+        small = cv2.resize(panel, (w, height))
+        if x + w > vis.shape[1] - 10:
+            break
+        cv2.rectangle(small, (0, 0), (w - 1, height - 1), (200, 200, 200), 1)
+        cv2.putText(small, label, (6, 16), FONT, 0.42, (230, 230, 230), 1, cv2.LINE_AA)
+        vis[10:10 + height, x:x + w] = small
+        x += w + 8
+    return vis
+
+
 def draw_distance_lines(
     image: np.ndarray,
     objects,
