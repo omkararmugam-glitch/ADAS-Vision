@@ -157,6 +157,47 @@ Replacing the pseudo-labels with `det_train.json` turns every table below from
 | YOLOPv2 (vehicles only) | — | — | n/a | n/a | n/a | — | — |
 | VRU model | — | n/a | — | — | — | — | — |
 
+## 2b. Learned lane segmenter — a negative result, kept on record
+
+Trained LRASPP-MobileNetV3 on 4,285 weak labels distilled from the classical
+segmenter (12 epochs, Dice + class-weighted cross-entropy at 512x288).
+
+| | |
+|---|---|
+| Best IoU vs. teacher | **0.302** |
+| Checkpoint | `models/lane_seg/weights/lane_seg.pt` |
+| Verdict | **not adopted — worse than the classical detector it copies** |
+
+IoU against the teacher cannot settle "is it better", because the student is
+*supposed* to disagree wherever the teacher was wrong. So the two were rendered
+side by side on the same four frames. The result:
+
+| Frame | Outcome |
+|---|---|
+| Urban, wide road | worse — large blobs on open tarmac, no corridor |
+| Suburban, clear markings | **better** — a full corridor where classical fitted a stub |
+| Traffic queue | much worse — mask spread across car bodies |
+| Underpass | worse — scattered blobs, corridor lost |
+
+One frame in four improved. The failure mode is consistent: the network predicts
+**blobs where the teacher predicts thin lines**. Three causes, in order of
+likely size:
+
+1. **Too few labels.** 4,285 frames of the 70,000 available. Thin-structure
+   segmentation is data-hungry and this is not enough for the network to learn
+   that a marking is a *line*.
+2. **Dice on thin structures at reduced resolution.** Dice rewards overlap area,
+   and at 512x288 a 3-pixel marking is barely more than one pixel wide;
+   thickening a prediction costs little Dice and gains recall.
+3. **Upsampling 288 to 720** widens everything by 2.5x before the mask is used.
+
+None of these is fixed by more epochs, which is why the run was not extended.
+The honest next step is more weak labels and a higher training resolution, not a
+longer schedule.
+
+**The classical segmenter remains the default.** Being able to say that is the
+value of having rendered the comparison rather than trusting the IoU.
+
 ## 2. Lane segmentation — mIoU
 
 | Model | Dataset / split | IoU lane | IoU drivable | mIoU | Pixel acc. |
