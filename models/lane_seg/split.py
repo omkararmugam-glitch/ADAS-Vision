@@ -30,7 +30,7 @@ Two things this deliberately does not do:
 
 from __future__ import annotations
 
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
 from enum import Enum
 
@@ -204,9 +204,18 @@ class SplitTracker:
 
         self._active = True
         self._cooldown_left = self.cooldown
-        # Report the strongest of the supporting frames rather than the latest:
-        # the most recent frame is not necessarily the clearest view.
-        return max(hits, key=lambda s: s.divergence_ratio)
+
+        # Side by MAJORITY across the supporting frames, not from whichever
+        # single frame diverged most. Taking the strongest frame let the alert
+        # say "right branch" while the HUD, reading the current frame, said
+        # "left" -- two answers to the same question on one screen. A majority
+        # is also more robust: the clearest frame is not always the correct one,
+        # and a fork's side is the one thing that stays constant while its
+        # measured ratio does not.
+        sides = Counter(h.side for h in hits)
+        majority = sides.most_common(1)[0][0]
+        agreeing = [h for h in hits if h.side is majority] or hits
+        return max(agreeing, key=lambda s: s.divergence_ratio)
 
     def reset(self) -> None:
         self._recent.clear()

@@ -199,3 +199,43 @@ class TestEngineIntegration:
         for i in range(20):
             d = engine.update(i, i / 30, [], self._lanes_forking())
             assert not [a for a in d.alerts if a.type is AlertType.ROAD_SPLIT]
+
+
+class TestSideConsistency:
+    """The reported side must not contradict what the frames actually show.
+
+    Reporting the single strongest frame let the alert say "right branch" while
+    the HUD, reading the current frame, said "left" -- two answers to the same
+    question on one screen.
+    """
+
+    @staticmethod
+    def _s(side: SplitSide, ratio: float) -> RoadSplit:
+        return RoadSplit(side=side, near_separation_m=3.5,
+                         far_separation_m=3.5 * ratio, divergence_ratio=ratio,
+                         gore_distance_m=20.0, left_role="ego_left",
+                         right_role="ego_right")
+
+    def test_the_majority_side_wins_over_the_strongest_frame(self) -> None:
+        """One very strong outlier must not overrule three agreeing frames."""
+        t = SplitTracker(min_frames=4, window=8)
+        t.update(self._s(SplitSide.LEFT, 1.9))
+        t.update(self._s(SplitSide.LEFT, 2.0))
+        t.update(self._s(SplitSide.RIGHT, 9.0))     # strongest, but outnumbered
+        got = t.update(self._s(SplitSide.LEFT, 2.1))
+        assert got is not None
+        assert got.side is SplitSide.LEFT
+
+    def test_the_clearest_frame_of_the_majority_is_reported(self) -> None:
+        t = SplitTracker(min_frames=3, window=8)
+        t.update(self._s(SplitSide.LEFT, 1.8))
+        t.update(self._s(SplitSide.LEFT, 3.1))
+        got = t.update(self._s(SplitSide.LEFT, 2.0))
+        assert got is not None
+        assert got.divergence_ratio == pytest.approx(3.1)
+
+    def test_a_unanimous_side_is_unchanged(self) -> None:
+        t = SplitTracker(min_frames=3, window=8)
+        for _ in range(3):
+            got = t.update(self._s(SplitSide.RIGHT, 2.0))
+        assert got is not None and got.side is SplitSide.RIGHT
