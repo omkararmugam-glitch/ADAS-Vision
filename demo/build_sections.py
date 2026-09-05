@@ -50,6 +50,7 @@ from core.overlay import (
     draw_lane_area,
     draw_lane_fits,
     draw_split,
+    draw_split_smooth,
     lane_hud_lines,
 )
 from core.types import CLASS_IDS, FrameResult, LaneSet, LaneStatus, class_name
@@ -274,8 +275,7 @@ def main(argv: list[str] | None = None) -> int:
 
         # 02 lane split
         if counts["02_lane_split"] < args.n and split is not None and cam is not None:
-            vis = draw_lane_fits(frame.copy(), lanes, cam, cfg.overlay)
-            vis = draw_split(vis, split, lanes, cam, cfg.overlay)
+            vis = draw_split_smooth(frame, split, lanes, cam, cfg.overlay)
             cv2.imwrite(str(args.out / "02_lane_split" / f"{stem}.jpg"),
                         _titled(vis, "road split",
                                 f"{split.side.value} @ {split.gore_distance_m:.0f} m "

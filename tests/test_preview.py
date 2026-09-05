@@ -218,3 +218,84 @@ class TestDistanceLines:
         out = draw_distance_lines(img, [self._obj(float("inf"))], self._camera(),
                                   OverlayConfig())
         assert np.array_equal(img, out)
+
+
+class TestSmoothSplitRendering:
+    """Long smooth curves along each diverging boundary.
+
+    The earlier treatment marked WHERE the split was with a diamond but drew the
+    boundaries as short segments, so the fork itself -- two curves parting
+    company -- was not visible. Showing the divergence is the point of detecting
+    it.
+    """
+
+    @staticmethod
+    def _camera():
+        from core.calibrate import (
+            CameraModel, rectangle_world_points, solve_ground_homography,
+        )
+        W, H, F, CH, P = 1280, 720, 900.0, 1.5, np.deg2rad(-4.0)
+
+        def project(pts):
+            pts = np.asarray(pts, float).reshape(-1, 2)
+            x, y = pts[:, 0], pts[:, 1]
+            z = -CH
+            c, s = np.cos(P), np.sin(P)
+            yc, zc = c * y - s * z, s * y + c * z
+            return np.column_stack([F * (x / yc) + W / 2, F * (-zc / yc) + H / 2])
+
+        world = rectangle_world_points(3.5, 6.0, 30.0)
+        Hm, _ = solve_ground_homography(project(world), world)
+        return CameraModel(H_image_to_ground=Hm, image_size=(W, H))
+
+    @staticmethod
+    def _lanes():
+        from core.types import LaneFit, LaneSet, LaneStatus
+        def fit(role, c, b=0.0):
+            # 6-34 m: the same span the split tests use. A shorter range gives a
+            # divergence ratio below the detection gate, so no split is found and
+            # the rendering under test never runs.
+            return LaneFit(coeffs=np.array([0.0, b, c]), role=role,
+                           n_pixels=400, y_range_m=(6.0, 34.0))
+        return LaneSet(status=LaneStatus.OK,
+                       ego_left=fit("ego_left", -1.75),
+                       ego_right=fit("ego_right", 1.75, 0.12),
+                       eval_distance_m=10.0)
+
+    def _split(self):
+        from models.lane_seg.split import detect_split
+        return detect_split(self._lanes())
+
+    def test_a_split_is_drawn(self) -> None:
+        from core.overlay import draw_split_smooth
+        img = np.full((720, 1280, 3), 45, np.uint8)
+        out = draw_split_smooth(img, self._split(), self._lanes(),
+                                self._camera(), OverlayConfig())
+        assert not np.array_equal(img, out)
+
+    def test_no_split_draws_nothing(self) -> None:
+        from core.overlay import draw_split_smooth
+        img = np.full((720, 1280, 3), 45, np.uint8)
+        assert np.array_equal(
+            img, draw_split_smooth(img, None, self._lanes(),
+                                   self._camera(), OverlayConfig()))
+
+    def test_the_curve_extends_past_the_fitted_range(self) -> None:
+        """A fit supported by a short stub of dashes still has to reach the road."""
+        from core.overlay import draw_smooth_curve
+        from models.lane_seg.fitting import fit_to_image_points
+        cam = self._camera()
+        fit = self._lanes().ego_left
+        plain = len(fit_to_image_points(fit, cam))
+        img = np.full((720, 1280, 3), 45, np.uint8)
+        out = draw_smooth_curve(img.copy(), fit, cam, (0, 255, 0))
+        painted = int((out != 45).any(axis=2).sum())
+        assert painted > plain, "the extended curve must cover more than the fit alone"
+
+    def test_the_source_frame_is_not_modified(self) -> None:
+        from core.overlay import draw_split_smooth
+        img = np.full((720, 1280, 3), 45, np.uint8)
+        before = img.copy()
+        draw_split_smooth(img, self._split(), self._lanes(),
+                          self._camera(), OverlayConfig())
+        assert np.array_equal(img, before)

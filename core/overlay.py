@@ -411,6 +411,96 @@ def draw_distance_lines(
     return vis
 
 
+#: Smooth split rendering. Green, matching the convention for "this is the road
+#: geometry" rather than "this is an object".
+SPLIT_CURVE_COLOR = (80, 235, 80)
+
+
+def draw_smooth_curve(
+    image: np.ndarray,
+    fit,
+    camera: CameraModel,
+    colour: tuple[int, int, int],
+    thickness: int = 9,
+    extend_near_m: float = 3.0,
+    extend_far_m: float = 8.0,
+    samples: int = 160,
+) -> np.ndarray:
+    """Draw one boundary as a long, smooth curve.
+
+    Two differences from the plain fit rendering, both about legibility.
+
+    **Sample density.** 160 points instead of 40, so the polyline reads as a
+    curve rather than a chain of visible segments once it is drawn thickly.
+
+    **Controlled extension.** The fitted range is only as long as the pixels that
+    supported it, which on dashed markings is often a short stub in the middle of
+    the image. The curve is extended a little past that range so it reaches the
+    road it describes.
+
+    The extension is deliberately small and the *extrapolated* part is drawn
+    thinner. A quadratic run far beyond its support diverges fast, and a thick
+    confident curve out there would be an assertion the fit cannot back. Near and
+    far are extended by different amounts because the near end is bounded by the
+    bonnet while the far end runs to the horizon.
+    """
+    from models.lane_seg.fitting import fit_to_image_points
+
+    lo, hi = fit.y_range_m
+    inner = fit_to_image_points(fit, camera, (lo, hi), n_samples=samples)
+    if len(inner) >= 2:
+        cv2.polylines(image, [inner.reshape(-1, 1, 2).astype(np.int32)], False,
+                      colour, thickness, cv2.LINE_AA)
+
+    for a, b in ((max(0.5, lo - extend_near_m), lo), (hi, hi + extend_far_m)):
+        if b <= a:
+            continue
+        pts = fit_to_image_points(fit, camera, (a, b), n_samples=max(24, samples // 4))
+        if len(pts) >= 2:
+            cv2.polylines(image, [pts.reshape(-1, 1, 2).astype(np.int32)], False,
+                          colour, max(2, thickness // 2), cv2.LINE_AA)
+    return image
+
+
+def draw_split_smooth(
+    image: np.ndarray,
+    split,
+    lanes: LaneSet,
+    camera: CameraModel,
+    cfg: OverlayConfig,
+    thickness: int = 9,
+    show_label: bool = True,
+) -> np.ndarray:
+    """Render a road split as smooth curves along each diverging boundary.
+
+    Replaces the earlier amber-highlight-plus-diamond treatment. That marked
+    *where* the split was but drew the boundaries as short segments, so the fork
+    itself -- two curves parting company -- was not visible. Long smooth curves
+    show the divergence directly, which is the whole point of detecting it.
+    """
+    if split is None:
+        return image
+    vis = image.copy()
+    diverging = {split.left_role, split.right_role}
+    drawn = 0
+    for fit in lanes.all_fits():
+        if fit.role not in diverging:
+            continue
+        vis = draw_smooth_curve(vis, fit, camera, SPLIT_CURVE_COLOR, thickness)
+        drawn += 1
+    if not drawn:
+        return image
+
+    if show_label:
+        text = f"ROAD SPLIT  {split.side.value}  {split.gore_distance_m:.0f} m"
+        (tw, th), base = cv2.getTextSize(text, FONT, 0.66, 2)
+        x, y = 16, vis.shape[0] - 18
+        cv2.rectangle(vis, (x - 9, y - th - base - 4), (x + tw + 9, y + base + 2),
+                      (24, 24, 24), -1)
+        cv2.putText(vis, text, (x, y), FONT, 0.66, SPLIT_CURVE_COLOR, 2, cv2.LINE_AA)
+    return vis
+
+
 def draw_split(
     image: np.ndarray,
     split,
